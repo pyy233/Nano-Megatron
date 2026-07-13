@@ -31,6 +31,7 @@ class RankLocalShard:
     tensor_metadata: dict[str, ShardMetadata]
     layer_start: int | None = None
     layer_end: int | None = None
+    layer_ranges: tuple[tuple[int, int], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -49,6 +50,7 @@ class RankLocalShard:
                 if self.layer_start is None or self.layer_end is None
                 else [self.layer_start, self.layer_end]
             ),
+            "layer_ranges": [list(layer_range) for layer_range in self.layer_ranges],
             "tensor_metadata": {
                 key: metadata.to_dict() for key, metadata in self.tensor_metadata.items()
             },
@@ -58,6 +60,16 @@ class RankLocalShard:
     def from_dict(cls, value: Mapping[str, Any]) -> RankLocalShard:
         coordinate = value["coordinate"]
         layer_range = value.get("layer_range")
+        raw_layer_ranges = value.get("layer_ranges")
+        layer_ranges = (
+            tuple((int(item[0]), int(item[1])) for item in raw_layer_ranges)
+            if raw_layer_ranges is not None
+            else (
+                ()
+                if layer_range is None
+                else ((int(layer_range[0]), int(layer_range[1])),)
+            )
+        )
         return cls(
             shard_id=str(value["shard_id"]),
             writer_rank=int(value["writer_rank"]),
@@ -73,6 +85,7 @@ class RankLocalShard:
             },
             layer_start=None if layer_range is None else int(layer_range[0]),
             layer_end=None if layer_range is None else int(layer_range[1]),
+            layer_ranges=layer_ranges,
         )
 
 
@@ -134,6 +147,7 @@ class CheckpointManifest:
     topology_compatibility: dict[str, Any] | None = None
     run_config: Any | None = None
     group_plan: Any | None = None
+    virtual_stages_per_rank: int = 1
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -153,6 +167,7 @@ class CheckpointManifest:
             "topology_compatibility": json_compatible(self.topology_compatibility),
             "run_config": json_compatible(self.run_config),
             "group_plan": json_compatible(self.group_plan),
+            "virtual_stages_per_rank": self.virtual_stages_per_rank,
         }
 
     @classmethod
@@ -181,6 +196,7 @@ class CheckpointManifest:
             topology_compatibility=value.get("topology_compatibility"),
             run_config=value.get("run_config"),
             group_plan=value.get("group_plan"),
+            virtual_stages_per_rank=int(value.get("virtual_stages_per_rank", 1)),
         )
 
     def write(self, path: Path) -> None:
@@ -218,6 +234,7 @@ def make_manifest(
     rank_local_shards: tuple[RankLocalShard, ...] = (),
     rank_runtime_states: tuple[RankRuntimeState, ...] = (),
     run_config: object | None = None,
+    virtual_stages_per_rank: int = 1,
 ) -> CheckpointManifest:
     group_plan_method = getattr(parallel, "group_plan", None)
     group_plan = group_plan_method() if callable(group_plan_method) else None
@@ -261,9 +278,11 @@ def make_manifest(
             "shared_filesystem_required": bool(rank_local_shards) or fsdp2_dcp,
             "rng_exact_for_saved_coordinates": True,
             "new_replica_rng_policy": "keep_initialized_state_with_warning",
+            "virtual_stages_per_rank": virtual_stages_per_rank,
         },
         run_config=run_config,
         group_plan=group_plan,
+        virtual_stages_per_rank=virtual_stages_per_rank,
     )
 
 

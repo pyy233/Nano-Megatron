@@ -13,6 +13,7 @@ from torch import nn
 
 from nano_megatron.pipeline_parallel import (
     GPipeSchedule,
+    InterleavedOneForwardOneBackwardSchedule,
     OneForwardOneBackwardSchedule,
     P2PCommunicator,
     StepOutput,
@@ -87,9 +88,8 @@ def _place_unwrapped_model(
             "Trainer automatic placement requires model parameters and buffers on one "
             "device; place an intentionally heterogeneous model before data-parallel setup"
         )
-    already_placed = (
-        (not tensor_devices or tensor_devices == {device})
-        and (not parameter_dtypes or parameter_dtypes == {dtype})
+    already_placed = (not tensor_devices or tensor_devices == {device}) and (
+        not parameter_dtypes or parameter_dtypes == {dtype}
     )
     return model if already_placed else model.to(device=device, dtype=dtype)
 
@@ -195,6 +195,7 @@ class Trainer:
                 ),
                 activation_dtype=_torch_dtype(dtype_config),
                 device=device,
+                dynamic_shapes=self.config.pipeline.dynamic_activation_shapes,
             )
         schedule = _enum_value(self.config.pipeline.schedule)
         if schedule == "gpipe":
@@ -202,12 +203,29 @@ class Trainer:
                 self.parallel,
                 communicator,
                 compute_context=compute_context,
+                overlap_p2p=self.config.pipeline.overlap_p2p,
             )
         if schedule == "1f1b":
             return OneForwardOneBackwardSchedule(
                 self.parallel,
                 communicator,
                 compute_context=compute_context,
+                overlap_p2p=self.config.pipeline.overlap_p2p,
+            )
+        if schedule == "interleaved_1f1b":
+            if communicator is None:
+                raise ValueError("interleaved_1f1b requires pipeline size greater than one")
+            layout = getattr(self.model, "layout", None)
+            if layout is None:
+                raise TypeError(
+                    "interleaved_1f1b requires a model built as an explicit GPTPipeline"
+                )
+            return InterleavedOneForwardOneBackwardSchedule(
+                self.parallel,
+                layout,
+                communicator,
+                compute_context=compute_context,
+                overlap_p2p=self.config.pipeline.overlap_p2p,
             )
         raise ValueError(f"unknown pipeline schedule: {schedule}")
 
@@ -217,11 +235,10 @@ class Trainer:
         parameter = next(self.model.parameters(), None)
         if parameter is not None:
             routed_batch = _move_to_device(routed_batch, parameter.device)
+        actual_sequence_length = self._validate_runtime_sequence(routed_batch)
         microbatches = _number_microbatches(
             split_microbatches(routed_batch, self.config.training.micro_batch_size),
-            start_index=(
-                self.state.step * self.config.training.gradient_accumulation_steps
-            ),
+            start_index=(self.state.step * self.config.training.gradient_accumulation_steps),
         )
         expected = self.config.training.gradient_accumulation_steps
         if len(microbatches) != expected:
@@ -249,9 +266,31 @@ class Trainer:
         )
         self.state.consumed_tokens += (
             self.config.global_batch_size(world_size=self.parallel.topology.world_size)
-            * self.config.model.seq_length
+            * actual_sequence_length
         )
         return output
+
+    def _validate_runtime_sequence(self, batch: Any) -> int:
+        input_ids = batch.get("input_ids") if isinstance(batch, dict) else None
+        if not isinstance(input_ids, torch.Tensor) or input_ids.ndim < 2:
+            return int(self.config.model.seq_length)
+        local_sequence = int(input_ids.shape[-1])
+        global_sequence = local_sequence * int(self.parallel.cp.size)
+        if (
+            not self.config.pipeline.dynamic_activation_shapes
+            and global_sequence != self.config.model.seq_length
+        ):
+            raise ValueError(
+                "runtime sequence length differs from model.seq_length while "
+                "pipeline.dynamic_activation_shapes is disabled: "
+                f"{global_sequence} != {self.config.model.seq_length}"
+            )
+        if self.config.parallel.sequence_parallel and local_sequence % int(self.parallel.tp.size):
+            raise ValueError(
+                "sequence parallelism requires the CP-local runtime sequence length "
+                "to be divisible by TP"
+            )
+        return global_sequence
 
     @torch.no_grad()
     def evaluate_step(self, batch: Any) -> StepOutput:
@@ -260,9 +299,8 @@ class Trainer:
         parameter = next(self.model.parameters(), None)
         if parameter is not None:
             routed_batch = _move_to_device(routed_batch, parameter.device)
-        microbatches = split_microbatches(
-            routed_batch, self.config.training.micro_batch_size
-        )
+        self._validate_runtime_sequence(routed_batch)
+        microbatches = split_microbatches(routed_batch, self.config.training.micro_batch_size)
         return self.schedule.forward_backward(
             stage=self.model,
             microbatches=microbatches,
@@ -280,16 +318,29 @@ class Trainer:
         if iterator is None:
             raise ValueError("Trainer.fit requires a data iterator")
         target = self.config.training.max_steps if max_steps is None else max_steps
-        while self.state.step < target:
-            if self.batch_router.is_source:
-                batch = next(iterator)
-                self._data_batches_consumed += 1
-            else:
-                batch = None
-            self.train_step(batch)
-            if self.checkpoint is not None and self._should_save():
-                self.save_checkpoint()
+        try:
+            while self.state.step < target:
+                if self.batch_router.is_source:
+                    batch = next(iterator)
+                    self._data_batches_consumed += 1
+                else:
+                    batch = None
+                self.train_step(batch)
+                if self.checkpoint is not None and self._should_save():
+                    self.save_checkpoint()
+        finally:
+            if self.checkpoint is not None:
+                flush = getattr(self.checkpoint, "flush", None)
+                if callable(flush):
+                    flush()
         return self.state
+
+    def close(self) -> None:
+        if self.checkpoint is None:
+            return
+        close = getattr(self.checkpoint, "close", None)
+        if callable(close):
+            close()
 
     def restore_data_position(self) -> None:
         """Advance a deterministic source iterator to the restored optimizer step.
@@ -306,9 +357,7 @@ class Trainer:
                 self.config.training.micro_batch_size
                 * self.config.training.gradient_accumulation_steps
             )
-            samples_per_data_batch = (
-                self.batch_router.data_replica_count * local_batch_size
-            )
+            samples_per_data_batch = self.batch_router.data_replica_count * local_batch_size
             if self.state.consumed_samples % samples_per_data_batch:
                 raise RuntimeError(
                     "restored consumed_samples is incompatible with the current DP/EP "
@@ -353,6 +402,9 @@ class Trainer:
     def load_checkpoint(self, path: str | Path) -> TrainerState:
         if self.checkpoint is None:
             raise RuntimeError("no CheckpointManager was configured")
+        flush = getattr(self.checkpoint, "flush", None)
+        if callable(flush):
+            flush()
         loaded = self.checkpoint.load(
             path,
             model=self.model,

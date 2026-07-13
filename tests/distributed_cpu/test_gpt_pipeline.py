@@ -24,6 +24,7 @@ from nano_megatron.nn.kernels import TorchKernelBackend
 from nano_megatron.parallel import ParallelContext
 from nano_megatron.pipeline_parallel import (
     GPipeSchedule,
+    InterleavedOneForwardOneBackwardSchedule,
     OneForwardOneBackwardSchedule,
     P2PCommunicator,
 )
@@ -168,16 +169,28 @@ def _pipeline_worker(rank: int, rendezvous: str, schedule_name: str) -> None:
             reference_loss = reference_loss + scaled_loss.detach()
             scaled_loss.backward()
 
+        overlap_dynamic = schedule_name.endswith("-overlap-dynamic")
         communicator = P2PCommunicator(
             parallel,
-            activation_shape=(1, config.seq_length, config.hidden_size),
+            activation_shape=(
+                None if overlap_dynamic else (1, config.seq_length, config.hidden_size)
+            ),
             activation_dtype=torch.float32,
             device="cpu",
+            dynamic_shapes=overlap_dynamic,
         )
-        if schedule_name == "gpipe":
-            schedule = GPipeSchedule(parallel, communicator)
+        if schedule_name.startswith("gpipe"):
+            schedule = GPipeSchedule(
+                parallel,
+                communicator,
+                overlap_p2p=overlap_dynamic,
+            )
         else:
-            schedule = OneForwardOneBackwardSchedule(parallel, communicator)
+            schedule = OneForwardOneBackwardSchedule(
+                parallel,
+                communicator,
+                overlap_p2p=overlap_dynamic,
+            )
         result = schedule.forward_backward(
             stage=stage,
             microbatches=microbatches,
@@ -259,6 +272,115 @@ def _pipeline_worker(rank: int, rendezvous: str, schedule_name: str) -> None:
         runtime.close()
 
 
+def _interleaved_gpt_worker(rank: int, rendezvous: str) -> None:
+    os.environ.update(RANK=str(rank), WORLD_SIZE="2", LOCAL_RANK=str(rank))
+    os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
+    runtime = DistributedRuntime(
+        DistributedConfig(
+            backend="gloo",
+            device="cpu",
+            init_method=f"file://{rendezvous}",
+        )
+    ).initialize()
+    parallel = ParallelContext.create(
+        runtime,
+        ParallelConfig(pipeline=2, data=1),
+    )
+    try:
+        config = GPTConfig(
+            layers=4,
+            hidden_size=8,
+            ffn_hidden_size=16,
+            heads=2,
+            kv_heads=2,
+            seq_length=4,
+            vocab_size=16,
+            dropout=0.0,
+            tie_embeddings=True,
+            bias=False,
+        )
+        kernels = TorchKernelBackend()
+        torch.manual_seed(4021)
+        reference = GPTModel(config, parallel=_SingleParallel(), kernels=kernels)
+        built = GPTModelBuilder().build_pipeline(
+            config,
+            parallel,
+            kernels,
+            virtual_stages_per_rank=2,
+        )
+        pipeline = built.model
+        for chunk in pipeline.chunks:
+            _copy_reference_partition(reference, chunk.model)
+
+        microbatches = [
+            {
+                "input_ids": torch.tensor([[0, 2, 5, 9]]),
+                "labels": torch.tensor([[2, 5, 9, 1]]),
+            },
+            {
+                "input_ids": torch.tensor([[3, 7, 11, 15]]),
+                "labels": torch.tensor([[7, 11, 15, 4]]),
+            },
+        ]
+        reference_losses = []
+        for batch in microbatches:
+            output = reference(batch["input_ids"], labels=batch["labels"])
+            assert output.loss is not None
+            reference_losses.append(output.loss.detach())
+            (output.loss / len(microbatches)).backward()
+
+        communicator = P2PCommunicator(
+            parallel,
+            activation_shape=None,
+            activation_dtype=torch.float32,
+            device="cpu",
+            dynamic_shapes=True,
+        )
+        result = InterleavedOneForwardOneBackwardSchedule(
+            parallel,
+            built.layout,
+            communicator,
+            overlap_p2p=True,
+        ).forward_backward(stage=pipeline, microbatches=microbatches)
+
+        if parallel.is_pipeline_last_stage():
+            torch.testing.assert_close(
+                sum(result.losses),
+                sum(reference_losses) / len(reference_losses),
+                atol=3.0e-5,
+                rtol=3.0e-4,
+            )
+        else:
+            assert result.losses == ()
+        for chunk in pipeline.chunks:
+            for local_layer, global_layer_index in zip(
+                chunk.model.layers,
+                range(chunk.model.layer_start, chunk.model.layer_end),
+                strict=True,
+            ):
+                _assert_module_gradients(
+                    local_layer,
+                    reference.layers[global_layer_index],
+                )
+        endpoint = pipeline.chunks[0] if rank == 0 else pipeline.chunks[-1]
+        tied_weight = (
+            endpoint.model.embedding.weight
+            if endpoint.model.embedding is not None
+            else endpoint.model.lm_head.weight
+        )
+        assert tied_weight.grad is not None
+        assert reference.embedding is not None
+        torch.testing.assert_close(
+            tied_weight.grad,
+            reference.embedding.weight.grad,
+            atol=3.0e-5,
+            rtol=3.0e-4,
+        )
+    finally:
+        parallel.close()
+        runtime.close()
+
+
 def _pipeline_zero_worker(rank: int, rendezvous: str, zero_mode: str) -> None:
     os.environ.update(RANK=str(rank), WORLD_SIZE="4", LOCAL_RANK=str(rank))
     os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
@@ -317,7 +439,11 @@ def _pipeline_zero_worker(rank: int, rendezvous: str, zero_mode: str) -> None:
             )
 
         strategy = build_data_parallel_strategy(
-            DataParallelConfig(mode=zero_mode, bucket_bytes=512),
+            DataParallelConfig(
+                mode=zero_mode,
+                bucket_bytes=512,
+                overlap_grad_reduce=True,
+            ),
             OffloadConfig(),
             parallel,
             built.parameter_domains,
@@ -350,11 +476,16 @@ def _pipeline_zero_worker(rank: int, rendezvous: str, zero_mode: str) -> None:
 
         communicator = P2PCommunicator(
             parallel,
-            activation_shape=(1, config.seq_length, config.hidden_size),
+            activation_shape=None,
             activation_dtype=torch.float32,
             device="cpu",
+            dynamic_shapes=True,
         )
-        schedule = OneForwardOneBackwardSchedule(parallel, communicator)
+        schedule = OneForwardOneBackwardSchedule(
+            parallel,
+            communicator,
+            overlap_p2p=True,
+        )
         strategy.zero_grad()
         result = schedule.forward_backward(
             stage=stage,
@@ -433,7 +564,10 @@ def _pipeline_zero_worker(rank: int, rendezvous: str, zero_mode: str) -> None:
 
 
 @pytest.mark.distributed
-@pytest.mark.parametrize("schedule_name", ["gpipe", "1f1b"])
+@pytest.mark.parametrize(
+    "schedule_name",
+    ["gpipe", "gpipe-overlap-dynamic", "1f1b", "1f1b-overlap-dynamic"],
+)
 def test_two_stage_gpt_matches_eager_with_tied_embeddings(
     tmp_path: Path,
     schedule_name: str,
@@ -442,6 +576,19 @@ def test_two_stage_gpt_matches_eager_with_tied_embeddings(
     mp.spawn(
         _pipeline_worker,
         args=(str(rendezvous), schedule_name),
+        nprocs=2,
+        join=True,
+    )
+
+
+@pytest.mark.distributed
+def test_interleaved_gpt_matches_eager_with_tied_embeddings(
+    tmp_path: Path,
+) -> None:
+    rendezvous = tmp_path / "gpt-interleaved.rendezvous"
+    mp.spawn(
+        _interleaved_gpt_worker,
+        args=(str(rendezvous),),
         nprocs=2,
         join=True,
     )

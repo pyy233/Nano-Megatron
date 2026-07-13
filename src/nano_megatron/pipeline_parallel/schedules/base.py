@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from typing import Any
@@ -10,10 +11,18 @@ import torch
 from torch import Tensor
 
 
-def data_parallel_context(strategy: Any, *, is_last_microbatch: bool):
+def data_parallel_context(
+    strategy: Any,
+    *,
+    is_last_microbatch: bool,
+    unit: Any | None = None,
+):
     if strategy is None or not hasattr(strategy, "microbatch_context"):
         return nullcontext()
-    return strategy.microbatch_context(is_last_microbatch=is_last_microbatch)
+    context = strategy.microbatch_context
+    if unit is not None and "unit" in inspect.signature(context).parameters:
+        return context(is_last_microbatch=is_last_microbatch, unit=unit)
+    return context(is_last_microbatch=is_last_microbatch)
 
 
 def activation_context(strategy: Any):
@@ -22,11 +31,21 @@ def activation_context(strategy: Any):
     return strategy.activation_context()
 
 
-def forward_data_parallel_context(strategy: Any, *, synchronize_gradients: bool):
+def forward_data_parallel_context(
+    strategy: Any,
+    *,
+    synchronize_gradients: bool,
+    unit: Any | None = None,
+):
     if strategy is None:
         return nullcontext()
     context = getattr(strategy, "forward_microbatch_context", None)
     if callable(context):
+        if unit is not None and "unit" in inspect.signature(context).parameters:
+            return context(
+                synchronize_gradients=synchronize_gradients,
+                unit=unit,
+            )
         return context(synchronize_gradients=synchronize_gradients)
     return activation_context(strategy)
 

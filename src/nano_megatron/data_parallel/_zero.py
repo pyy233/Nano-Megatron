@@ -18,7 +18,7 @@ from ._common import (
     process_group,
     reduce_model_parallel_squared_norm,
 )
-from .buckets import FlatBucket, build_flat_buckets
+from .buckets import BucketGradientReducer, FlatBucket, build_flat_buckets
 from .interface import DataParallelStrategy
 from .offload import OptimizerStateStorage
 
@@ -46,6 +46,7 @@ class FlatShardZeROStrategy(DataParallelStrategy):
         self._optimizer_config: object | None = None
         self._step = 0
         self._gradients_ready = False
+        self.gradient_reducer: BucketGradientReducer | None = None
 
     def setup(
         self,
@@ -64,14 +65,29 @@ class FlatShardZeROStrategy(DataParallelStrategy):
             raise RuntimeError(
                 f"{self.mode} with replica size > 1 requires initialized torch.distributed"
             )
+        self.gradient_reducer = BucketGradientReducer(
+            self.buckets,
+            partition_gradients=self.gradient_partitioned,
+            reduction_dtype=self.grad_reduce_dtype,
+            overlap=bool(config_value(self.config, "overlap_grad_reduce", False)),
+            is_final_backward=lambda: self._sync_this_backward,
+        )
         self._optimizer_config = optimizer_config
         self._model = model
         self._initialize_shards()
         return model
 
     @contextmanager
-    def microbatch_context(self, *, is_last_microbatch: bool) -> Iterator[None]:
-        with super().microbatch_context(is_last_microbatch=is_last_microbatch):
+    def microbatch_context(
+        self,
+        *,
+        is_last_microbatch: bool,
+        unit: nn.Module | None = None,
+    ) -> Iterator[None]:
+        with super().microbatch_context(
+            is_last_microbatch=is_last_microbatch,
+            unit=unit,
+        ):
             yield
 
     @torch.no_grad()
@@ -104,11 +120,9 @@ class FlatShardZeROStrategy(DataParallelStrategy):
 
     @torch.no_grad()
     def _reduce_gradients(self) -> None:
-        for bucket in self.buckets:
-            if self.gradient_partitioned:
-                bucket.reduce_scatter_gradient(dtype=self.grad_reduce_dtype)
-            else:
-                bucket.all_reduce_gradient(dtype=self.grad_reduce_dtype)
+        if self.gradient_reducer is None:
+            raise RuntimeError(f"{type(self).__name__}.setup() must be called first")
+        self.gradient_reducer.finalize()
         self._gradients_ready = True
 
     @torch.no_grad()
@@ -183,6 +197,9 @@ class FlatShardZeROStrategy(DataParallelStrategy):
             bucket.unpack_parameters(full_parameter)
 
     def zero_grad(self) -> None:
+        if self.gradient_reducer is None:
+            raise RuntimeError(f"{type(self).__name__}.setup() must be called first")
+        self.gradient_reducer.reset()
         for parameter in self.model.parameters():
             parameter.grad = None
         for bucket in self.buckets:

@@ -2,8 +2,10 @@
 
 from nano_megatron.models.gpt.attention import GPTAttention
 from nano_megatron.models.gpt.builder import (
+    BuiltGPTPipeline,
     BuiltGPTStage,
     GPTModelBuilder,
+    GPTPipeline,
     GPTPipelineStage,
     LayerPartition,
 )
@@ -14,6 +16,7 @@ from nano_megatron.models.gpt.model import GPTModel, GPTOutput
 from nano_megatron.models.gpt.tied_embeddings import TiedEmbeddingSynchronizer
 
 __all__ = [
+    "BuiltGPTPipeline",
     "BuiltGPTStage",
     "DenseGPTComponents",
     "GPTAttention",
@@ -23,6 +26,7 @@ __all__ = [
     "GPTModel",
     "GPTModelBuilder",
     "GPTOutput",
+    "GPTPipeline",
     "GPTPipelineStage",
     "LayerPartition",
     "TiedEmbeddingSynchronizer",

@@ -71,6 +71,19 @@ def test_custom_group_key_and_channel_are_extensible() -> None:
     }
 
 
+def test_default_pipeline_transport_groups_reuse_ranks_on_distinct_channels() -> None:
+    topology = ParallelTopology.from_sizes(pipeline=5, data=2)
+    pp = DEFAULT_GROUP_PLAN.groups(topology, GroupKey.PP)
+    transport_1 = DEFAULT_GROUP_PLAN.groups(topology, GroupKey.PP_TRANSPORT_1)
+    transport_2 = DEFAULT_GROUP_PLAN.groups(topology, GroupKey.PP_TRANSPORT_2)
+
+    assert [group.ranks for group in transport_1] == [group.ranks for group in pp]
+    assert [group.ranks for group in transport_2] == [group.ranks for group in pp]
+    assert DEFAULT_GROUP_PLAN.spec(GroupKey.PP).channel == "default"
+    assert DEFAULT_GROUP_PLAN.spec(GroupKey.PP_TRANSPORT_1).channel == "pp_transport_1"
+    assert DEFAULT_GROUP_PLAN.spec(GroupKey.PP_TRANSPORT_2).channel == "pp_transport_2"
+
+
 def test_out_of_range_selection_is_rejected_during_expansion() -> None:
     plan = GroupPlan(
         GroupSpec(
@@ -110,17 +123,26 @@ class FakeRuntime:
         return process_group, ranks, name
 
 
-def test_registry_reuses_same_ranks_backend_and_channel() -> None:
+def test_registry_reuses_singleton_resources_across_channels() -> None:
     topology = ParallelTopology.from_sizes()
     runtime = FakeRuntime(rank=0, world_size=1)
     registry = ParallelGroupRegistry(runtime, topology).materialize(DEFAULT_GROUP_PLAN)
 
-    # All default groups collapse to rank (0,) and share the default channel.
+    # There is no communication to isolate for singleton groups, so all
+    # default collectives and transport channels collapse to one resource.
     assert len(runtime.created) == 1
     assert registry.resource_count == 1
     assert (
         registry.group(GroupKey.TP).process_group
         is registry.group(GroupKey.DENSE_REPLICA).process_group
+    )
+    assert (
+        registry.group(GroupKey.PP_TRANSPORT_1).process_group
+        is registry.group(GroupKey.PP).process_group
+    )
+    assert (
+        registry.group(GroupKey.PP_TRANSPORT_2).process_group
+        is registry.group(GroupKey.PP_TRANSPORT_1).process_group
     )
     assert registry.mesh(GroupKey.TP)[1] == (0,)
 
@@ -140,3 +162,14 @@ def test_registry_keeps_same_ranks_on_distinct_channels_separate() -> None:
 
     assert len(runtime.created) == 2
     assert registry.group("grad").process_group is not registry.group("params").process_group
+
+
+def test_registry_keeps_multi_rank_pipeline_transports_separate() -> None:
+    topology = ParallelTopology.from_sizes(pipeline=2)
+    runtime = FakeRuntime(rank=0, world_size=2)
+    registry = ParallelGroupRegistry(runtime, topology).materialize(DEFAULT_GROUP_PLAN)
+
+    pp = registry.group(GroupKey.PP).process_group
+    transport_1 = registry.group(GroupKey.PP_TRANSPORT_1).process_group
+    transport_2 = registry.group(GroupKey.PP_TRANSPORT_2).process_group
+    assert len({id(pp), id(transport_1), id(transport_2)}) == 3

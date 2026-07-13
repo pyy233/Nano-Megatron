@@ -14,6 +14,8 @@ from .topology import ParallelTopology
 class GroupKey(StrEnum):
     TP = "tp"
     PP = "pp"
+    PP_TRANSPORT_1 = "pp_transport_1"
+    PP_TRANSPORT_2 = "pp_transport_2"
     CP = "cp"
     EP = "ep"
     DP_AXIS = "dp_axis"
@@ -204,6 +206,21 @@ def _selected_values(size: int, selection: tuple[int, ...] | None) -> tuple[int,
 DEFAULT_GROUP_PLAN = GroupPlan(
     GroupSpec(GroupKey.TP, frozenset({ParallelAxis.TP})),
     GroupSpec(GroupKey.PP, frozenset({ParallelAxis.PP})),
+    # NCCL may coalesce every operation in one batch_isend_irecv call into a
+    # single Work.  Separate pipeline transport channels let a receive be
+    # waited without also draining the previous activation/gradient send.
+    # PP itself is transport color 0; these communicators provide colors 1/2
+    # for a proper coloring of both even and odd physical pipeline cycles.
+    GroupSpec(
+        GroupKey.PP_TRANSPORT_1,
+        frozenset({ParallelAxis.PP}),
+        channel="pp_transport_1",
+    ),
+    GroupSpec(
+        GroupKey.PP_TRANSPORT_2,
+        frozenset({ParallelAxis.PP}),
+        channel="pp_transport_2",
+    ),
     GroupSpec(GroupKey.CP, frozenset({ParallelAxis.CP})),
     GroupSpec(GroupKey.EP, frozenset({ParallelAxis.EP})),
     GroupSpec(GroupKey.DP_AXIS, frozenset({ParallelAxis.DP})),

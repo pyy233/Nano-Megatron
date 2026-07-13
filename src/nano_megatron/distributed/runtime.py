@@ -123,6 +123,11 @@ class DistributedRuntime:
                 "rank": rank,
                 "world_size": world_size,
             }
+            if device_type == "cuda" and "nccl" in backend.lower():
+                # Bind collective barriers and object-collective staging to the
+                # same explicit local CUDA device instead of asking NCCL to
+                # guess from the global rank.
+                kwargs["device_id"] = device
             try:
                 dist.init_process_group(**kwargs)
             except Exception as error:

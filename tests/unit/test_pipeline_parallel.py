@@ -8,10 +8,20 @@ from nano_megatron.pipeline_parallel import (  # noqa: E402
     GPipeSchedule,
     OneForwardOneBackwardSchedule,
     P2PCommunicator,
+    PipelineEvent,
+    PipelineEventKind,
+    PipelineWork,
     StepOutput,
+    VirtualPipelineLayout,
+    build_gpipe_plan,
+    build_interleaved_plan,
+    build_interleaved_schedule_table,
     partition_layers,
 )
 from nano_megatron.pipeline_parallel.schedules import build_1f1b_plan  # noqa: E402
+from nano_megatron.pipeline_parallel.schedules.executor import (  # noqa: E402
+    VirtualPipelineRoute,
+)
 from nano_megatron.training.trainer import _compute_context  # noqa: E402
 
 
@@ -26,6 +36,108 @@ def test_partition_layers_is_balanced_and_complete() -> None:
 def test_partition_rejects_empty_stages() -> None:
     with pytest.raises(ValueError, match="empty stages"):
         partition_layers(2, 3)
+
+
+def test_virtual_pipeline_layout_maps_chunks_without_a_global_virtual_rank() -> None:
+    layout = VirtualPipelineLayout(
+        num_layers=8,
+        pipeline_size=2,
+        virtual_stages_per_rank=2,
+    )
+
+    assert [
+        (partition.start_layer, partition.end_layer) for partition in layout.local_partitions(0)
+    ] == [(0, 2), (4, 6)]
+    assert [
+        (partition.start_layer, partition.end_layer) for partition in layout.local_partitions(1)
+    ] == [(2, 4), (6, 8)]
+    wrap = layout.next(layout.address(1, 0))
+    assert wrap == layout.address(0, 1)
+    assert layout.previous(wrap) == layout.address(1, 0)
+    assert layout.is_first(layout.address(0, 0))
+    assert layout.is_last(layout.address(1, 1))
+
+
+def test_interleaved_plan_has_one_forward_and_backward_for_every_work_key() -> None:
+    table = build_interleaved_schedule_table(4, 2, 2)
+    assert [(item.microbatch, item.chunk) for item in table] == [
+        (0, 0),
+        (1, 0),
+        (0, 1),
+        (1, 1),
+        (2, 0),
+        (3, 0),
+        (2, 1),
+        (3, 1),
+    ]
+    for rank in range(2):
+        events = build_interleaved_plan(
+            pipeline_size=2,
+            pipeline_rank=rank,
+            num_microbatches=4,
+            num_chunks=2,
+        )
+        assert all(isinstance(event, PipelineEvent) for event in events)
+        actions = [action for event in events for action in event.actions]
+        forwards = [action.work for action in actions if action.kind is PipelineEventKind.FORWARD]
+        backwards = [action.work for action in actions if action.kind is PipelineEventKind.BACKWARD]
+        assert set(forwards) == set(table)
+        assert set(backwards) == set(table)
+        positions = {work: index for index, work in enumerate(forwards)}
+        seen: set[PipelineWork] = set()
+        for event in events:
+            for action in event.actions:
+                if action.kind is PipelineEventKind.FORWARD:
+                    seen.add(action.work)
+                else:
+                    assert action.work in seen
+        steady_events = [event for event in events if event.phase == "steady"]
+        assert all(event.forward is not None for event in steady_events)
+        assert all(event.backward is not None for event in steady_events)
+        assert all(len(event.actions) == 2 for event in steady_events)
+        assert len(positions) == 8
+
+
+@pytest.mark.parametrize("num_microbatches", [1, 3])
+def test_interleaved_forward_only_accepts_small_or_partial_microbatch_groups(
+    num_microbatches: int,
+) -> None:
+    events = build_interleaved_plan(
+        pipeline_size=2,
+        pipeline_rank=0,
+        num_microbatches=num_microbatches,
+        num_chunks=2,
+        forward_only=True,
+    )
+
+    actions = [action for event in events for action in event.actions]
+    work = [action.work for action in actions]
+    assert len(work) == num_microbatches * 2
+    assert all(action.kind is PipelineEventKind.FORWARD for action in actions)
+    assert all(len(event.actions) == 1 for event in events)
+    assert {item.microbatch for item in work} == set(range(num_microbatches))
+
+
+def test_virtual_pipeline_route_translates_pp_local_peers_and_chunks() -> None:
+    group = type(
+        "Group",
+        (),
+        {
+            "rank": 0,
+            "size": 2,
+            "global_rank_at": staticmethod(lambda rank: (2, 5)[rank]),
+        },
+    )()
+    parallel = type("Parallel", (), {"pp": group})()
+    layout = VirtualPipelineLayout(4, 2, 2)
+    route = VirtualPipelineRoute(parallel, layout)
+
+    first = PipelineWork(0, 0)
+    later = PipelineWork(0, 1)
+    assert route.previous(first) is None
+    assert (route.following(first).peer, route.following(first).chunk) == (5, 0)
+    assert (route.previous(later).peer, route.previous(later).chunk) == (5, 0)
+    assert (route.following(later).peer, route.following(later).chunk) == (5, 1)
 
 
 def test_pipeline_objects_require_explicit_pp_group() -> None:
@@ -59,9 +171,37 @@ def test_pipeline_communicator_rejects_unmaterialized_multi_rank_group() -> None
 
 def test_1f1b_plan_has_one_forward_and_backward_per_microbatch() -> None:
     events = build_1f1b_plan(pipeline_size=4, pipeline_rank=1, num_microbatches=6)
-    assert sum(event.kind == "forward" for event in events) == 6
-    assert sum(event.kind == "backward" for event in events) == 6
-    assert [event.phase for event in events[:2]] == ["warmup", "warmup"]
+    assert all(len(event.actions) == 1 for event in events)
+    assert [
+        (event.phase, action.kind, action.work) for event in events for action in event.actions
+    ] == [
+        ("warmup", PipelineEventKind.FORWARD, PipelineWork(0)),
+        ("warmup", PipelineEventKind.FORWARD, PipelineWork(1)),
+        ("steady", PipelineEventKind.FORWARD, PipelineWork(2)),
+        ("steady", PipelineEventKind.BACKWARD, PipelineWork(0)),
+        ("steady", PipelineEventKind.FORWARD, PipelineWork(3)),
+        ("steady", PipelineEventKind.BACKWARD, PipelineWork(1)),
+        ("steady", PipelineEventKind.FORWARD, PipelineWork(4)),
+        ("steady", PipelineEventKind.BACKWARD, PipelineWork(2)),
+        ("steady", PipelineEventKind.FORWARD, PipelineWork(5)),
+        ("steady", PipelineEventKind.BACKWARD, PipelineWork(3)),
+        ("cooldown", PipelineEventKind.BACKWARD, PipelineWork(4)),
+        ("cooldown", PipelineEventKind.BACKWARD, PipelineWork(5)),
+    ]
+
+
+def test_gpipe_plan_uses_single_action_frames_in_forward_then_reverse_backward_order() -> None:
+    events = build_gpipe_plan(3)
+
+    assert all(len(event.actions) == 1 for event in events)
+    assert [(action.kind, action.work) for event in events for action in event.actions] == [
+        (PipelineEventKind.FORWARD, PipelineWork(0)),
+        (PipelineEventKind.FORWARD, PipelineWork(1)),
+        (PipelineEventKind.FORWARD, PipelineWork(2)),
+        (PipelineEventKind.BACKWARD, PipelineWork(2)),
+        (PipelineEventKind.BACKWARD, PipelineWork(1)),
+        (PipelineEventKind.BACKWARD, PipelineWork(0)),
+    ]
 
 
 def test_gpipe_wraps_forward_in_activation_offload_context() -> None:
@@ -73,6 +213,14 @@ def test_gpipe_wraps_forward_in_activation_offload_context() -> None:
         @staticmethod
         def is_pipeline_last_stage() -> bool:
             return True
+
+        @staticmethod
+        def pipeline_prev_rank() -> None:
+            return None
+
+        @staticmethod
+        def pipeline_next_rank() -> None:
+            return None
 
     class Stage(torch.nn.Module):
         def __init__(self) -> None:
@@ -131,6 +279,14 @@ def test_gpipe_reports_average_loss_metric_over_microbatches() -> None:
         def is_pipeline_last_stage() -> bool:
             return True
 
+        @staticmethod
+        def pipeline_prev_rank() -> None:
+            return None
+
+        @staticmethod
+        def pipeline_next_rank() -> None:
+            return None
+
     class Stage:
         def __call__(self, hidden_states, batch):
             del hidden_states
@@ -153,6 +309,14 @@ def test_gpipe_rejects_structured_outputs_at_the_sharding_boundary() -> None:
         @staticmethod
         def is_pipeline_last_stage() -> bool:
             return True
+
+        @staticmethod
+        def pipeline_prev_rank() -> None:
+            return None
+
+        @staticmethod
+        def pipeline_next_rank() -> None:
+            return None
 
     class StructuredOutput:
         def __init__(self, loss):
@@ -180,6 +344,14 @@ def test_gpipe_requires_a_scalar_loss_from_the_last_stage() -> None:
         @staticmethod
         def is_pipeline_last_stage() -> bool:
             return True
+
+        @staticmethod
+        def pipeline_prev_rank() -> None:
+            return None
+
+        @staticmethod
+        def pipeline_next_rank() -> None:
+            return None
 
     class Stage:
         def __call__(self, hidden_states, batch):

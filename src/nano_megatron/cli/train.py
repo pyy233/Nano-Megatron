@@ -61,11 +61,21 @@ def run(config_path: Path, *, overrides: Sequence[str], resume: Path | None, max
         cp_attention = build_context_parallel_attention(config.context_parallel, parallel)
         domains = ParameterDomainRegistry()
         components = DenseGPTComponents(cp_attention=cp_attention)
-        built = GPTModelBuilder(
+        builder = GPTModelBuilder(
             components,
             parameter_domains=domains,
             activation_checkpoint_config=config.activation_checkpoint,
-        ).build_stage(config.model, parallel, kernels, rng=rng)
+        )
+        if config.pipeline.virtual_stages_per_rank > 1:
+            built = builder.build_pipeline(
+                config.model,
+                parallel,
+                kernels,
+                virtual_stages_per_rank=config.pipeline.virtual_stages_per_rank,
+                rng=rng,
+            )
+        else:
+            built = builder.build_stage(config.model, parallel, kernels, rng=rng)
         model = built.model.to(device=runtime.device, dtype=_dtype(config.precision.params))
 
         strategy = build_data_parallel_strategy(
@@ -89,10 +99,13 @@ def run(config_path: Path, *, overrides: Sequence[str], resume: Path | None, max
             data_iterator=iter(data),
             rng=rng,
         )
-        if resume is not None:
-            trainer.load_checkpoint(resume)
-            trainer.restore_data_position()
-        state = trainer.fit(max_steps=max_steps)
+        try:
+            if resume is not None:
+                trainer.load_checkpoint(resume)
+                trainer.restore_data_position()
+            state = trainer.fit(max_steps=max_steps)
+        finally:
+            trainer.close()
         if runtime.is_primary:
             print(
                 f"finished step={state.step} samples={state.consumed_samples} "

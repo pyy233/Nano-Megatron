@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import os
 from collections.abc import Mapping
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,7 @@ from torch import Tensor, nn
 from torch.distributed.checkpoint.state_dict import get_state_dict
 
 from nano_megatron.checkpoint import CheckpointManager, CheckpointManifest
+from nano_megatron.checkpoint import manager as checkpoint_manager_module
 from nano_megatron.config import (
     CheckpointConfig,
     DataParallelConfig,
@@ -106,6 +108,7 @@ def _assert_local_state_close(actual: Any, expected: Any) -> None:
 
 def _initialize_runtime(rank: int, world_size: int, rendezvous: str) -> DistributedRuntime:
     os.environ.update(RANK=str(rank), WORLD_SIZE=str(world_size), LOCAL_RANK=str(rank))
+    os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
     return DistributedRuntime(
         DistributedConfig(
             backend="gloo",
@@ -356,6 +359,249 @@ def test_ddp_zero12_checkpoint_round_trip_and_dp_reshard(tmp_path: Path) -> None
             runtime.close()
 
 
+def _async_rank_local_worker(
+    rank: int,
+    world_size: int,
+    rendezvous: str,
+    checkpoint_root: str,
+) -> None:
+    runtime = _initialize_runtime(rank, world_size, rendezvous)
+    parallel = ParallelContext.create(runtime, ParallelConfig(data=world_size))
+    manager: CheckpointManager | None = None
+    try:
+        torch.manual_seed(307)
+        model = nn.Linear(3, 2)
+        registry = ParameterDomainRegistry()
+        registry.register_module(model, ParameterDomain.DENSE)
+        strategy = build_data_parallel_strategy(
+            DataParallelConfig(mode="zero2", bucket_bytes=64),
+            OffloadConfig(),
+            parallel,
+            registry,
+        )
+        strategy.setup(model, OptimizerConfig(lr=0.01), registry)
+        _take_optimizer_step(model, strategy, scale=float(rank + 1))
+        expected_model = copy.deepcopy(model.state_dict())
+        expected_optimizer = copy.deepcopy(strategy.state_dict())
+
+        manager = CheckpointManager(
+            config=CheckpointConfig(
+                directory=Path(checkpoint_root) / "async_zero2",
+                save_interval=1,
+                async_save=True,
+            ),
+            parallel=parallel,
+        )
+        checkpoint = manager.save(
+            8,
+            model=model,
+            data_parallel=strategy,
+            trainer_state={"step": 8},
+        )
+        assert not (checkpoint / ".complete").exists()
+
+        # Training collectives are allowed to continue while rank-local files are
+        # written.  Final checkpoint collectives are deliberately deferred to flush().
+        _take_optimizer_step(model, strategy, scale=float(rank + 9))
+        manager.flush()
+        assert (checkpoint / ".complete").is_file()
+        assert manager.latest() == checkpoint
+
+        manifest = CheckpointManifest.read(checkpoint / "manifest.json")
+        assert manifest.storage_backend == "rank_local_torch.save"
+        assert len(manifest.rank_local_shards) == 1
+        assert len(manifest.rank_runtime_states) == world_size
+        assert manager.load(
+            checkpoint,
+            model=model,
+            data_parallel=strategy,
+        ) == {"step": 8}
+        _assert_nested_close(model.state_dict(), expected_model)
+        _assert_nested_close(
+            strategy.state_dict(),
+            expected_optimizer,
+            ignore_metadata=True,
+        )
+        manager.close()
+    finally:
+        if manager is not None:
+            with suppress(BaseException):
+                manager.close()
+        parallel.close()
+        runtime.close()
+
+
+@pytest.mark.distributed
+def test_async_rank_local_checkpoint_allows_training_before_flush(tmp_path: Path) -> None:
+    rendezvous = tmp_path / "async.rendezvous"
+    mp.spawn(
+        _async_rank_local_worker,
+        args=(2, str(rendezvous), str(tmp_path)),
+        nprocs=2,
+        join=True,
+    )
+
+
+def _async_failure_worker(
+    rank: int,
+    world_size: int,
+    rendezvous: str,
+    checkpoint_root: str,
+) -> None:
+    runtime = _initialize_runtime(rank, world_size, rendezvous)
+    parallel = ParallelContext.create(runtime, ParallelConfig(data=world_size))
+    manager: CheckpointManager | None = None
+    original_write = checkpoint_manager_module._write_torch_payloads
+    try:
+        model = nn.Linear(3, 2)
+        registry = ParameterDomainRegistry()
+        registry.register_module(model, ParameterDomain.DENSE)
+        strategy = build_data_parallel_strategy(
+            DataParallelConfig(mode="zero2", bucket_bytes=64),
+            OffloadConfig(),
+            parallel,
+            registry,
+        )
+        strategy.setup(model, OptimizerConfig(lr=0.01), registry)
+
+        if rank == 1:
+
+            def fail_write(payloads: list[tuple[Any, Path]]) -> None:
+                del payloads
+                raise OSError("rank-local disk failure")
+
+            checkpoint_manager_module._write_torch_payloads = fail_write
+
+        manager = CheckpointManager(
+            config=CheckpointConfig(
+                directory=Path(checkpoint_root) / "async_failure",
+                save_interval=1,
+                async_save=True,
+            ),
+            parallel=parallel,
+        )
+        checkpoint = manager.save(
+            9,
+            model=model,
+            data_parallel=strategy,
+            trainer_state={"step": 9},
+        )
+        with pytest.raises(RuntimeError, match="rank 1.*rank-local disk failure"):
+            manager.flush()
+        assert not (checkpoint / ".complete").exists()
+        assert not (checkpoint / "manifest.json").exists()
+        with pytest.raises(RuntimeError, match="rank-local disk failure"):
+            manager.close()
+    finally:
+        checkpoint_manager_module._write_torch_payloads = original_write
+        if manager is not None:
+            with suppress(BaseException):
+                manager.close()
+        parallel.close()
+        runtime.close()
+
+
+@pytest.mark.distributed
+def test_async_checkpoint_propagates_remote_write_failure(tmp_path: Path) -> None:
+    rendezvous = tmp_path / "async-failure.rendezvous"
+    mp.spawn(
+        _async_failure_worker,
+        args=(2, str(rendezvous), str(tmp_path)),
+        nprocs=2,
+        join=True,
+    )
+
+
+def _existing_target_preflight_worker(
+    rank: int,
+    world_size: int,
+    rendezvous: str,
+    checkpoint_root: str,
+    async_save: bool,
+) -> None:
+    runtime = _initialize_runtime(rank, world_size, rendezvous)
+    # PP2 makes every DP subgroup local, so this regression also proves that
+    # preflight error propagation uses the runtime WORLD group.
+    parallel = ParallelContext.create(runtime, ParallelConfig(pipeline=world_size))
+    manager: CheckpointManager | None = None
+    try:
+        model = nn.Linear(3, 2)
+        registry = ParameterDomainRegistry()
+        registry.register_module(model, ParameterDomain.DENSE)
+        strategy = build_data_parallel_strategy(
+            DataParallelConfig(mode="zero2", bucket_bytes=64),
+            OffloadConfig(),
+            parallel,
+            registry,
+        )
+        strategy.setup(model, OptimizerConfig(lr=0.01), registry)
+
+        directory = Path(checkpoint_root)
+        manager = CheckpointManager(
+            config=CheckpointConfig(
+                directory=directory,
+                save_interval=1,
+                async_save=async_save,
+            ),
+            parallel=parallel,
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="checkpoint save preflight failed.*rank 0: FileExistsError",
+        ):
+            manager.save(
+                1,
+                model=model,
+                data_parallel=strategy,
+                trainer_state={"step": 1},
+            )
+
+        # A preflight error is synchronous: no pending work exists and it is not
+        # sticky like a latent background write failure.  The manager remains usable.
+        assert manager._pending is None
+        assert manager._async_error is None
+        manager.flush()
+        recovered = manager.save(
+            2,
+            model=model,
+            data_parallel=strategy,
+            trainer_state={"step": 2},
+        )
+        manager.flush()
+        assert (recovered / ".complete").is_file()
+        manager.close()
+    finally:
+        if manager is not None:
+            with suppress(BaseException):
+                manager.close()
+        parallel.close()
+        runtime.close()
+
+
+@pytest.mark.distributed
+@pytest.mark.parametrize("async_save", [False, True], ids=["sync", "async"])
+def test_existing_incomplete_target_preflight_error_reaches_every_rank(
+    tmp_path: Path,
+    async_save: bool,
+) -> None:
+    directory = tmp_path / ("async_preflight" if async_save else "sync_preflight")
+    incomplete = directory / "step_00000001"
+    incomplete.mkdir(parents=True)
+    (incomplete / "partial-payload").write_text("incomplete\n")
+
+    rendezvous = tmp_path / f"preflight-{async_save}.rendezvous"
+    mp.spawn(
+        _existing_target_preflight_worker,
+        args=(2, str(rendezvous), str(directory), async_save),
+        nprocs=2,
+        join=True,
+    )
+
+    assert (incomplete / "partial-payload").read_text() == "incomplete\n"
+    assert not (incomplete / ".complete").exists()
+    assert (directory / "step_00000002" / ".complete").is_file()
+
+
 def _dp_expand_rng_worker(
     rank: int,
     world_size: int,
@@ -518,6 +764,7 @@ def _zero3_save_worker(
             config=CheckpointConfig(
                 directory=Path(checkpoint_root) / "zero3_dp2",
                 save_interval=1,
+                async_save=True,
             ),
             parallel=parallel,
         )
@@ -527,6 +774,8 @@ def _zero3_save_worker(
             data_parallel=strategy,
             trainer_state={"step": 3},
         )
+        assert not (checkpoint / ".complete").exists()
+        manager.flush()
         manifest = CheckpointManifest.read(checkpoint / "manifest.json")
         assert manifest.storage_backend == "fsdp2_dcp"
         assert manifest.topology_compatibility is not None
@@ -553,6 +802,7 @@ def _zero3_save_worker(
             torch.testing.assert_close(actual, expected)
         _, restored_optimizer = get_state_dict(model, strategy.optimizer)
         _assert_local_state_close(restored_optimizer, expected_optimizer)
+        manager.close()
     finally:
         parallel.close()
         runtime.close()

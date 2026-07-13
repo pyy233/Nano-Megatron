@@ -88,10 +88,37 @@ def validate_config(
                 "has no sharding effect"
             )
 
-    if model.layers < parallel.pipeline:
+    logical_pipeline_stages = parallel.pipeline * config.pipeline.virtual_stages_per_rank
+    if model.layers < logical_pipeline_stages:
         errors.append(
-            f"model.layers ({model.layers}) must be >= parallel.pipeline ({parallel.pipeline})"
+            f"model.layers ({model.layers}) must be >= parallel.pipeline * "
+            "pipeline.virtual_stages_per_rank "
+            f"({parallel.pipeline} * {config.pipeline.virtual_stages_per_rank} = "
+            f"{logical_pipeline_stages})"
         )
+
+    interleaved = config.pipeline.schedule is PipelineSchedule.INTERLEAVED_ONE_F_ONE_B
+    if interleaved:
+        if parallel.pipeline == 1:
+            errors.append("interleaved_1f1b requires parallel.pipeline > 1")
+        if config.pipeline.virtual_stages_per_rank < 2:
+            errors.append("interleaved_1f1b requires pipeline.virtual_stages_per_rank >= 2")
+        if config.training.gradient_accumulation_steps < parallel.pipeline:
+            errors.append(
+                "interleaved_1f1b requires gradient_accumulation_steps >= parallel.pipeline"
+            )
+        if config.training.gradient_accumulation_steps % parallel.pipeline != 0:
+            errors.append(
+                "interleaved_1f1b requires gradient_accumulation_steps to be "
+                "divisible by parallel.pipeline"
+            )
+        if model.layers % logical_pipeline_stages:
+            notices.append(
+                "interleaved pipeline chunks have uneven layer counts because "
+                "model.layers is not divisible by PP * virtual_stages_per_rank"
+            )
+    elif config.pipeline.virtual_stages_per_rank != 1:
+        errors.append("pipeline.virtual_stages_per_rank > 1 requires schedule=interleaved_1f1b")
 
     if (
         config.pipeline.schedule is PipelineSchedule.ONE_F_ONE_B
@@ -135,19 +162,22 @@ def validate_config(
         notices.append(
             "data_parallel.overlap_grad_reduce is managed internally by FSDP2 in zero3 mode"
         )
-    elif config.data_parallel.overlap_grad_reduce:
-        errors.append(
-            "data_parallel.overlap_grad_reduce is not implemented for ddp/zero1/zero2 "
-            "in phase one; set it to false"
+    elif (
+        config.data_parallel.overlap_grad_reduce
+        and data_parallel_size is not None
+        and data_parallel_size * parallel.expert * parallel.context == 1
+    ):
+        notices.append(
+            "data_parallel.overlap_grad_reduce has no communication effect on a "
+            "size-one replica group"
         )
 
-    if config.pipeline.overlap_p2p:
-        errors.append(
-            "pipeline.overlap_p2p is not implemented in phase one; set it to false"
-        )
-    if config.checkpoint.async_save:
-        errors.append(
-            "checkpoint.async_save is not implemented in phase one; set it to false"
+    if config.pipeline.overlap_p2p and parallel.pipeline == 1:
+        notices.append("pipeline.overlap_p2p has no communication effect when parallel.pipeline=1")
+    if config.pipeline.dynamic_activation_shapes and parallel.pipeline == 1:
+        notices.append(
+            "pipeline.dynamic_activation_shapes has no communication effect when "
+            "parallel.pipeline=1"
         )
 
     if (

@@ -177,6 +177,30 @@ def test_builder_constructs_the_local_pipeline_stage() -> None:
             assert built.parameter_domains.placement(module.out_proj.weight).tensor_shard_dim == 1
 
 
+def test_builder_constructs_explicit_virtual_pipeline_chunks() -> None:
+    config = TinyGPTConfig(layers=8)
+    parallel = FakeParallel(pp=FakeGroup(rank=0, size=2))
+    built = GPTModelBuilder(DenseGPTComponents()).build_pipeline(
+        config,
+        parallel,
+        TorchKernelBackend(),
+        virtual_stages_per_rank=2,
+    )
+
+    assert [
+        (partition.start_layer, partition.end_layer)
+        for partition in built.partitions
+    ] == [(0, 2), (4, 6)]
+    assert built.model.chunk(0).partition.owns_embedding
+    assert not built.model.chunk(1).partition.owns_lm_head
+    assert built.model.sharding_units() == tuple(built.model.chunks)
+    assert len(built.parameter_domains) == len(tuple(built.model.parameters()))
+    assert all(
+        built.parameter_domains.domain(parameter) is ParameterDomain.DENSE
+        for parameter in built.model.parameters()
+    )
+
+
 def test_single_stage_pipeline_wrapper_unpacks_batch_and_returns_loss() -> None:
     config = TinyGPTConfig(layers=1)
     built = GPTModelBuilder().build_stage(

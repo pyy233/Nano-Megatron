@@ -39,6 +39,24 @@ def _registered(model: nn.Module) -> ParameterDomainRegistry:
     return registry
 
 
+class _VirtualShardChunk(nn.Linear):
+    def __init__(self) -> None:
+        super().__init__(2, 2, bias=False)
+        self.gradient_sync_calls: list[tuple[bool, bool]] = []
+
+    def set_requires_gradient_sync(self, value: bool, *, recurse: bool = True) -> None:
+        self.gradient_sync_calls.append((value, recurse))
+
+
+class _VirtualShardContainer(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.chunks = nn.ModuleList([_VirtualShardChunk(), _VirtualShardChunk()])
+
+    def sharding_units(self) -> tuple[nn.Module, ...]:
+        return tuple(self.chunks)
+
+
 def test_norm_scalar_collective_device_follows_the_explicit_backend() -> None:
     parallel = SimpleNamespace(runtime=SimpleNamespace(device=torch.device("cuda", 1)))
     nccl_group = SimpleNamespace(backend="nccl")
@@ -222,6 +240,7 @@ def test_zero3_forwards_fsdp2_reshard_precision_and_pin_memory_options(
     import torch.distributed.fsdp as fsdp
 
     captured: dict[str, object] = {}
+    sharded_modules: list[nn.Module] = []
 
     class _FakeCPUOffloadPolicy:
         def __init__(self, *, pin_memory: bool = True) -> None:
@@ -232,6 +251,7 @@ def test_zero3_forwards_fsdp2_reshard_precision_and_pin_memory_options(
             self.reduce_dtype = reduce_dtype
 
     def _fully_shard(module: nn.Module, **options: object) -> nn.Module:
+        sharded_modules.append(module)
         captured.update(options)
         return module
 
@@ -271,9 +291,126 @@ def test_zero3_forwards_fsdp2_reshard_precision_and_pin_memory_options(
 
     assert strategy.setup(model, OptimizerConfig(), registry) is model
     assert strategy.uses_fsdp2
+    assert sharded_modules == [model]
     assert captured["reshard_after_forward"] is False
     assert captured["mp_policy"].reduce_dtype is torch.float32
     assert captured["offload_policy"].pin_memory is False
+
+
+def test_zero3_fully_shards_virtual_chunks_and_keeps_outer_checkpoint_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import torch.distributed.checkpoint.state_dict as dcp_state_dict
+    import torch.distributed.fsdp as fsdp
+
+    sharded_modules: list[nn.Module] = []
+
+    def _fully_shard(module: nn.Module, **_options: object) -> nn.Module:
+        sharded_modules.append(module)
+        module.weight = nn.Parameter(module.weight.detach().clone())  # type: ignore[attr-defined]
+        return module
+
+    checkpoint_call: dict[str, object] = {}
+
+    def _get_state_dict(
+        model: nn.Module,
+        optimizer: torch.optim.Optimizer,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, object]]:
+        checkpoint_call.update(model=model, optimizer=optimizer)
+        return {"model": torch.ones(())}, {"optimizer": object()}
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(fsdp, "fully_shard", _fully_shard)
+    monkeypatch.setattr(dcp_state_dict, "get_state_dict", _get_state_dict)
+
+    group = SimpleNamespace(
+        size=2,
+        rank=0,
+        ranks=(0, 1),
+        process_group=object(),
+    )
+    parallel = SimpleNamespace(
+        group=lambda _key: group,
+        mesh=lambda _key: object(),
+    )
+    model = _VirtualShardContainer()
+    original_parameters = tuple(model.parameters())
+    registry = _registered(model)
+    strategy = Zero3Strategy(
+        config=DataParallelConfig(mode="zero3"),
+        offload=OffloadConfig(),
+        parallel=parallel,
+        parameter_domains=registry,
+    )
+
+    assert strategy.setup(model, OptimizerConfig(), registry) is model
+    assert strategy.model is model
+    assert sharded_modules == list(model.chunks)
+    assert [item.name for item in strategy._domain_parameters] == [
+        "chunks.0.weight",
+        "chunks.1.weight",
+    ]
+    assert all(
+        item.parameter is dict(model.named_parameters())[item.name]
+        for item in strategy._domain_parameters
+    )
+    assert not set(original_parameters).intersection(model.parameters())
+    assert strategy.optimizer is not None
+    assert {
+        parameter
+        for group_options in strategy.optimizer.param_groups
+        for parameter in group_options["params"]
+    } == set(model.parameters())
+
+    first, second = model.chunks
+    with strategy.microbatch_context(is_last_microbatch=False, unit=first):
+        pass
+    assert first.gradient_sync_calls == [(False, True), (True, True)]
+    assert second.gradient_sync_calls == []
+
+    with strategy.microbatch_context(is_last_microbatch=True, unit=second):
+        pass
+    assert first.gradient_sync_calls == [(False, True), (True, True)]
+    assert second.gradient_sync_calls == [(True, True)]
+
+    with (
+        pytest.raises(ValueError, match="not one of the fully-sharded modules"),
+        strategy.microbatch_context(
+            is_last_microbatch=True,
+            unit=nn.Linear(2, 2),
+        ),
+    ):
+        pass
+
+    state = strategy.distributed_checkpoint_state_dict()
+    assert checkpoint_call == {"model": model, "optimizer": strategy.optimizer}
+    assert set(state) == {"model", "optimizer"}
+
+
+def test_zero3_size_one_leaves_virtual_chunk_container_unwrapped() -> None:
+    runtime, parallel = _parallel_context()
+    try:
+        model = _VirtualShardContainer()
+        registry = _registered(model)
+        strategy = Zero3Strategy(
+            config=DataParallelConfig(mode="zero3"),
+            offload=OffloadConfig(),
+            parallel=parallel,
+            parameter_domains=registry,
+        )
+
+        assert strategy.setup(model, OptimizerConfig(), registry) is model
+        assert strategy.model is model
+        assert not strategy.uses_fsdp2
+        with strategy.microbatch_context(
+            is_last_microbatch=False,
+            unit=model.chunks[0],
+        ):
+            pass
+        assert all(not chunk.gradient_sync_calls for chunk in model.chunks)
+    finally:
+        parallel.close()
+        runtime.close()
 
 
 @pytest.mark.parametrize("strategy_type", [Zero1Strategy, Zero2Strategy])
@@ -304,6 +441,43 @@ def test_zero_reduces_gradients_in_configured_precision(strategy_type: type) -> 
             and bucket.local_gradient.dtype is torch.float32
             for bucket in strategy.buckets
         )
+    finally:
+        parallel.close()
+        runtime.close()
+
+
+@pytest.mark.parametrize("strategy_type", [DDPStrategy, Zero1Strategy, Zero2Strategy])
+def test_overlap_size_one_zero_grad_and_finalize_are_idempotent(strategy_type: type) -> None:
+    runtime, parallel = _parallel_context()
+    try:
+        model = nn.Sequential(nn.Linear(3, 4), nn.Tanh(), nn.Linear(4, 2))
+        registry = _registered(model)
+        strategy = strategy_type(
+            config=DataParallelConfig(
+                mode=strategy_type.mode,
+                bucket_bytes=64,
+                overlap_grad_reduce=True,
+            ),
+            offload=OffloadConfig(),
+            parallel=parallel,
+            parameter_domains=registry,
+        )
+        strategy.setup(model, OptimizerConfig(weight_decay=0.0), registry)
+
+        for _ in range(2):
+            strategy.zero_grad()
+            with strategy.microbatch_context(is_last_microbatch=True):
+                strategy.backward(model(torch.randn(2, 3)).square().mean())
+            reducer = strategy.gradient_reducer
+            assert reducer is not None
+            assert reducer.start_count == len(reducer.buckets)
+            assert not reducer.finalized
+
+            strategy.finalize_gradients()
+            strategy.finalize_gradients()
+            assert reducer.finalized
+            assert reducer.wait_count == len(reducer.buckets)
+            strategy.optimizer_step()
     finally:
         parallel.close()
         runtime.close()

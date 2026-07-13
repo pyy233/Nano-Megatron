@@ -68,6 +68,7 @@ class DataParallelMode(StrEnum):
 class PipelineSchedule(StrEnum):
     ONE_F_ONE_B = "1f1b"
     GPIPE = "gpipe"
+    INTERLEAVED_ONE_F_ONE_B = "interleaved_1f1b"
 
 
 class ContextParallelBackend(StrEnum):
@@ -315,6 +316,8 @@ class PipelineConfig:
     schedule: PipelineSchedule = PipelineSchedule.ONE_F_ONE_B
     activation_dtype: PrecisionDType | None = None
     overlap_p2p: bool = False
+    virtual_stages_per_rank: int = 1
+    dynamic_activation_shapes: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -333,6 +336,12 @@ class PipelineConfig:
                 ),
             )
         _require_bool("pipeline.overlap_p2p", self.overlap_p2p)
+        _require_int(
+            "pipeline.virtual_stages_per_rank", self.virtual_stages_per_rank
+        )
+        _require_bool(
+            "pipeline.dynamic_activation_shapes", self.dynamic_activation_shapes
+        )
 
 
 @dataclass(frozen=True, slots=True)

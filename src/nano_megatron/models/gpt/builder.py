@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -12,7 +12,11 @@ from nano_megatron.models.gpt.factory import DenseGPTComponents, GPTComponentFac
 from nano_megatron.models.gpt.model import GPTModel
 from nano_megatron.models.gpt.tied_embeddings import TiedEmbeddingSynchronizer
 from nano_megatron.parallel import GroupKey, ParameterDomain, ParameterDomainRegistry
-from nano_megatron.pipeline_parallel import LayerPartition, partition_for_rank
+from nano_megatron.pipeline_parallel import (
+    LayerPartition,
+    VirtualPipelineLayout,
+    partition_for_rank,
+)
 from nano_megatron.tensor_parallel import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -30,6 +34,14 @@ if TYPE_CHECKING:
 class BuiltGPTStage:
     model: GPTPipelineStage
     partition: LayerPartition
+    parameter_domains: ParameterDomainRegistry
+
+
+@dataclass(frozen=True)
+class BuiltGPTPipeline:
+    model: GPTPipeline
+    partitions: tuple[LayerPartition, ...]
+    layout: VirtualPipelineLayout
     parameter_domains: ParameterDomainRegistry
 
 
@@ -118,6 +130,65 @@ class GPTModelBuilder:
         return BuiltGPTStage(
             model=model,
             partition=partition,
+            parameter_domains=registry,
+        )
+
+    def build_pipeline(
+        self,
+        model_config: GPTConfig,
+        parallel: ParallelContext,
+        kernels: KernelBackend,
+        *,
+        virtual_stages_per_rank: int,
+        rng: Any | None = None,
+    ) -> BuiltGPTPipeline:
+        """Build every virtual model chunk hosted by this physical PP rank."""
+
+        layout = VirtualPipelineLayout(
+            model_config.num_layers,
+            parallel.pp.size,
+            virtual_stages_per_rank,
+        )
+        partitions = layout.local_partitions(parallel.pp.rank)
+        registry = (
+            self.parameter_domains
+            if self.parameter_domains is not None
+            else ParameterDomainRegistry()
+        )
+        chunks: list[GPTPipelineStage] = []
+        for partition in partitions:
+            core_model = GPTModel(
+                model_config,
+                parallel=parallel,
+                kernels=kernels,
+                rng=rng,
+                components=self.components,
+                parameter_domains=registry,
+                activation_checkpoint_config=self.activation_checkpoint_config,
+                layer_start=partition.start_layer,
+                layer_end=partition.end_layer,
+                owns_embedding=partition.owns_embedding,
+                owns_final_norm=partition.owns_final_norm,
+                owns_lm_head=partition.owns_lm_head,
+            )
+            self._register_parameter_domains(core_model, registry)
+            tied_embeddings = self._build_tied_embedding_synchronizer(
+                model_config,
+                parallel,
+                core_model,
+                partition,
+            )
+            chunks.append(
+                GPTPipelineStage(
+                    core_model,
+                    partition,
+                    tied_embeddings=tied_embeddings,
+                )
+            )
+        return BuiltGPTPipeline(
+            model=GPTPipeline(chunks, layout),
+            partitions=partitions,
+            layout=layout,
             parameter_domains=registry,
         )
 
@@ -216,3 +287,41 @@ class GPTPipelineStage(nn.Module):
         if output.loss is None:
             raise ValueError("the last GPT pipeline stage requires batch['labels']")
         return output.loss
+
+
+class GPTPipeline(nn.Module):
+    """Explicit container for all virtual model chunks on one physical rank."""
+
+    def __init__(
+        self,
+        chunks: Sequence[GPTPipelineStage],
+        layout: VirtualPipelineLayout,
+    ) -> None:
+        super().__init__()
+        if len(chunks) != layout.virtual_stages_per_rank:
+            raise ValueError("the number of local chunks must match virtual_stages_per_rank")
+        self.chunks = nn.ModuleList(chunks)
+        self.layout = layout
+
+    def chunk(self, chunk_id: int) -> GPTPipelineStage:
+        if not 0 <= chunk_id < len(self.chunks):
+            raise IndexError(f"virtual pipeline chunk {chunk_id} is out of range")
+        return self.chunks[chunk_id]
+
+    def sharding_units(self) -> tuple[nn.Module, ...]:
+        return tuple(self.chunks)
+
+    def synchronize_tied_embedding_weights(self) -> None:
+        for chunk in self.chunks:
+            chunk.synchronize_tied_embedding_weights()
+
+    def synchronize_tied_embedding_gradients(self) -> None:
+        for chunk in self.chunks:
+            chunk.synchronize_tied_embedding_gradients()
+
+    def forward(self, hidden_states: Tensor | None, batch: Any) -> Tensor:
+        del hidden_states, batch
+        raise RuntimeError(
+            "GPTPipeline contains multiple virtual chunks; call chunk(id) through "
+            "an interleaved pipeline schedule"
+        )

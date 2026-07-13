@@ -91,7 +91,11 @@ class ParallelGroupRegistry:
         # deterministic order is a c10d correctness requirement.
         for planned in expanded:
             backend = planned.backend or self._runtime.backend
-            resource_key = _ResourceKey(planned.ranks, backend, planned.channel)
+            # A singleton communicator has no concurrent communication to
+            # isolate.  Reuse it across declared channels so PP=1 does not
+            # materialize two otherwise idle transport resources per family.
+            resource_channel = "default" if len(planned.ranks) == 1 else planned.channel
+            resource_key = _ResourceKey(planned.ranks, backend, resource_channel)
             if resource_key not in self._resources:
                 self._resources[resource_key] = self._runtime.new_group(
                     planned.ranks,

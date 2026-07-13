@@ -72,6 +72,7 @@ def _schedule_worker(
     schedule_name: str,
     num_microbatches: int,
     wire_dtype_name: str,
+    overlap_p2p: bool,
 ) -> None:
     os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
     dist.init_process_group(
@@ -107,9 +108,13 @@ def _schedule_worker(
         ]
         expected = _expected_gradients(microbatches, weights)
         schedule = (
-            GPipeSchedule(parallel, communicator)
+            GPipeSchedule(parallel, communicator, overlap_p2p=overlap_p2p)
             if schedule_name == "gpipe"
-            else OneForwardOneBackwardSchedule(parallel, communicator)
+            else OneForwardOneBackwardSchedule(
+                parallel,
+                communicator,
+                overlap_p2p=overlap_p2p,
+            )
         )
         schedule.forward_backward(stage=stage, microbatches=microbatches)
         assert stage.weight.grad is not None
@@ -125,18 +130,23 @@ def _schedule_worker(
 
 @pytest.mark.distributed
 @pytest.mark.parametrize(
-    ("schedule_name", "num_microbatches", "wire_dtype_name"),
+    ("schedule_name", "num_microbatches", "wire_dtype_name", "overlap_p2p"),
     [
-        ("gpipe", 4, "float64"),
-        ("1f1b", 4, "float64"),
-        ("1f1b", 1, "float64"),
-        ("1f1b", 4, "float32"),
+        ("gpipe", 4, "float64", False),
+        ("1f1b", 1, "float64", False),
+        ("1f1b", 1, "float64", True),
+        ("1f1b", 3, "float64", False),
+        ("1f1b", 3, "float64", True),
+        ("1f1b", 4, "float64", False),
+        ("1f1b", 4, "float64", True),
+        ("1f1b", 4, "float32", True),
     ],
 )
 def test_pipeline_schedule_gradients_match_eager_on_three_gloo_processes(
     schedule_name: str,
     num_microbatches: int,
     wire_dtype_name: str,
+    overlap_p2p: bool,
 ) -> None:
     world_size = 3
     handle, init_file = tempfile.mkstemp(prefix=f"nano-megatron-{schedule_name}-")
@@ -151,6 +161,7 @@ def test_pipeline_schedule_gradients_match_eager_on_three_gloo_processes(
                 schedule_name,
                 num_microbatches,
                 wire_dtype_name,
+                overlap_p2p,
             ),
             nprocs=world_size,
             join=True,

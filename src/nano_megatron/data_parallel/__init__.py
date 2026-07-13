@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from .buckets import FlatBucket, ParameterSlice, build_flat_buckets
+from .buckets import (
+    BucketGradientReducer,
+    FlatBucket,
+    GradientReductionRequest,
+    ParameterSlice,
+    build_flat_buckets,
+)
 from .ddp import DDPStrategy, ReplicatedStrategy
 from .interface import DataParallelStrategy
 from .offload import ActivationOffloader, OffloadPolicy, OptimizerStateStorage
@@ -47,9 +53,11 @@ ZeRO3Strategy = Zero3Strategy
 
 __all__ = [
     "ActivationOffloader",
+    "BucketGradientReducer",
     "DDPStrategy",
     "DataParallelStrategy",
     "FlatBucket",
+    "GradientReductionRequest",
     "OffloadPolicy",
     "OptimizerStateStorage",
     "ParameterSlice",

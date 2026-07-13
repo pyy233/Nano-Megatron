@@ -93,7 +93,10 @@ class DataParallelStrategy(ABC):
 
     @contextmanager
     def forward_microbatch_context(
-        self, *, synchronize_gradients: bool
+        self,
+        *,
+        synchronize_gradients: bool,
+        unit: nn.Module | None = None,
     ) -> Iterator[None]:
         """Wrap a microbatch forward.
 
@@ -103,12 +106,17 @@ class DataParallelStrategy(ABC):
         offload portion of this context.
         """
 
-        del synchronize_gradients
+        del synchronize_gradients, unit
         with self.activation_context():
             yield
 
     @contextmanager
-    def microbatch_context(self, *, is_last_microbatch: bool) -> Iterator[None]:
+    def microbatch_context(
+        self,
+        *,
+        is_last_microbatch: bool,
+        unit: nn.Module | None = None,
+    ) -> Iterator[None]:
         """Wrap backward for one microbatch.
 
         The name is kept for the public strategy contract and direct callers.
@@ -116,6 +124,7 @@ class DataParallelStrategy(ABC):
         DDP ``no_sync`` decision is made before the matching forward.
         """
 
+        del unit
         previous = self._sync_this_backward
         self._sync_this_backward = is_last_microbatch
         try:

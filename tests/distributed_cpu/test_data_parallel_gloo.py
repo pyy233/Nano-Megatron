@@ -44,6 +44,18 @@ class _RegressionStage(nn.Module):
         return self.projection(batch["input"]).square().mean()
 
 
+class _TwoLayerRegressionStage(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.input_projection = nn.Linear(2, 4, bias=False)
+        self.output_projection = nn.Linear(4, 1, bias=False)
+
+    def forward(self, hidden_states, batch):
+        del hidden_states
+        hidden = torch.tanh(self.input_projection(batch["input"]))
+        return self.output_projection(hidden).square().mean()
+
+
 def _zero_worker(rank: int, world_size: int, rendezvous: str, mode: str) -> None:
     os.environ.update(RANK=str(rank), WORLD_SIZE=str(world_size), LOCAL_RANK=str(rank))
     runtime = DistributedRuntime(
@@ -134,9 +146,13 @@ def _zero3_worker(rank: int, world_size: int, rendezvous: str) -> None:
         with strategy.microbatch_context(is_last_microbatch=True):
             strategy.backward(wrapped(inputs).square().mean())
         reference(inputs).square().mean().backward()
-        expected_norm = torch.stack(
-            [parameter.grad.float().square().sum() for parameter in reference.parameters()]
-        ).sum().sqrt()
+        expected_norm = (
+            torch.stack(
+                [parameter.grad.float().square().sum() for parameter in reference.parameters()]
+            )
+            .sum()
+            .sqrt()
+        )
         max_norm = expected_norm / 2.0
         norm = strategy.clip_grad_norm(float(max_norm))
         torch.testing.assert_close(norm, expected_norm, atol=2.0e-5, rtol=2.0e-5)
@@ -338,6 +354,104 @@ def _zero3_accumulation_worker(rank: int, world_size: int, rendezvous: str) -> N
         runtime.close()
 
 
+def _gradient_overlap_parity_worker(
+    rank: int,
+    world_size: int,
+    rendezvous: str,
+    mode: str,
+    overlap: bool,
+) -> None:
+    os.environ.update(RANK=str(rank), WORLD_SIZE=str(world_size), LOCAL_RANK=str(rank))
+    runtime = DistributedRuntime(
+        DistributedConfig(
+            backend="gloo",
+            device="cpu",
+            init_method=f"file://{rendezvous}",
+        )
+    ).initialize()
+    parallel = ParallelContext.create(runtime, ParallelConfig(data=world_size))
+    try:
+        torch.manual_seed(909)
+        model = _TwoLayerRegressionStage()
+        reference = deepcopy(model)
+        registry = ParameterDomainRegistry()
+        registry.register_module(model, ParameterDomain.DENSE)
+        optimizer_config = OptimizerConfig(lr=0.01, weight_decay=0.0)
+        strategy = build_data_parallel_strategy(
+            DataParallelConfig(
+                mode=mode,
+                bucket_bytes=16,
+                overlap_grad_reduce=overlap,
+            ),
+            OffloadConfig(),
+            parallel,
+            registry,
+        )
+        wrapped = strategy.setup(model, optimizer_config, registry)
+        strategy.zero_grad()
+        microbatches = [
+            {
+                "input": torch.tensor(
+                    [[rank + microbatch + 1.0, 0.25 * (microbatch + 1)]],
+                    dtype=torch.float32,
+                )
+            }
+            for microbatch in range(2)
+        ]
+        GPipeSchedule(_SingleStageParallel()).forward_backward(
+            stage=wrapped,
+            microbatches=microbatches,
+            data_parallel=strategy,
+        )
+
+        reducer = strategy.gradient_reducer
+        assert reducer is not None
+        assert len(reducer.buckets) == 2
+        if overlap:
+            assert reducer.start_count == 2
+            assert reducer.wait_count == 0
+            assert all(not request.completed for request in reducer.requests)
+        else:
+            assert reducer.start_count == 0
+
+        strategy.finalize_gradients()
+        assert reducer.start_count == 2
+        assert reducer.wait_count == 2
+
+        reference_optimizer = torch.optim.AdamW(
+            reference.parameters(),
+            lr=optimizer_config.lr,
+            betas=optimizer_config.betas,
+            eps=optimizer_config.eps,
+            weight_decay=optimizer_config.weight_decay,
+        )
+        for replica_rank in range(world_size):
+            for microbatch in range(2):
+                value = torch.tensor(
+                    [[replica_rank + microbatch + 1.0, 0.25 * (microbatch + 1)]],
+                    dtype=torch.float32,
+                )
+                reference(None, {"input": value}).div_(2 * world_size).backward()
+
+        expected_norm = (
+            torch.stack(
+                [parameter.grad.float().square().sum() for parameter in reference.parameters()]
+            )
+            .sum()
+            .sqrt()
+        )
+        norm = strategy.clip_grad_norm(1.0e6)
+        torch.testing.assert_close(norm, expected_norm, atol=1.0e-6, rtol=1.0e-6)
+
+        strategy.optimizer_step()
+        reference_optimizer.step()
+        for actual, expected in zip(model.parameters(), reference.parameters(), strict=True):
+            torch.testing.assert_close(actual, expected, atol=1.0e-7, rtol=1.0e-6)
+    finally:
+        parallel.close()
+        runtime.close()
+
+
 @pytest.mark.distributed
 @pytest.mark.parametrize("mode", ["zero1", "zero2"])
 def test_zero_flat_shards_on_two_gloo_processes(tmp_path: Path, mode: str) -> None:
@@ -391,6 +505,23 @@ def test_zero3_accumulation_matches_global_reference_on_two_gloo_processes(
     mp.spawn(
         _zero3_accumulation_worker,
         args=(2, str(rendezvous)),
+        nprocs=2,
+        join=True,
+    )
+
+
+@pytest.mark.distributed
+@pytest.mark.parametrize("mode", ["ddp", "zero1", "zero2"])
+@pytest.mark.parametrize("overlap", [False, True])
+def test_bucket_gradient_overlap_matches_global_reference_on_two_gloo_processes(
+    tmp_path: Path,
+    mode: str,
+    overlap: bool,
+) -> None:
+    rendezvous = tmp_path / f"{mode}-overlap-{overlap}.rendezvous"
+    mp.spawn(
+        _gradient_overlap_parity_worker,
+        args=(2, str(rendezvous), mode, overlap),
         nprocs=2,
         join=True,
     )

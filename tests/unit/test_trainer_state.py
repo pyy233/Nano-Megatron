@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-pytest.importorskip("torch")
+torch = pytest.importorskip("torch")
 
 from nano_megatron.training import Trainer, TrainerState  # noqa: E402
 from nano_megatron.training.trainer import _number_microbatches  # noqa: E402
@@ -67,3 +67,41 @@ def test_microbatch_numbers_can_continue_across_optimizer_steps() -> None:
         start_index=6,
     )
     assert [microbatch["_microbatch_index"] for microbatch in numbered] == [6, 7]
+
+
+def test_runtime_sequence_validation_supports_dynamic_lengths() -> None:
+    trainer = object.__new__(Trainer)
+    trainer.config = SimpleNamespace(
+        model=SimpleNamespace(seq_length=8),
+        pipeline=SimpleNamespace(dynamic_activation_shapes=True),
+        parallel=SimpleNamespace(sequence_parallel=False),
+    )
+    trainer.parallel = SimpleNamespace(
+        cp=SimpleNamespace(size=2),
+        tp=SimpleNamespace(size=1),
+    )
+
+    assert trainer._validate_runtime_sequence(
+        {"input_ids": torch.zeros(2, 3, dtype=torch.long)}
+    ) == 6
+
+
+def test_runtime_sequence_validation_rejects_static_or_invalid_sp_shapes() -> None:
+    trainer = object.__new__(Trainer)
+    trainer.config = SimpleNamespace(
+        model=SimpleNamespace(seq_length=8),
+        pipeline=SimpleNamespace(dynamic_activation_shapes=False),
+        parallel=SimpleNamespace(sequence_parallel=False),
+    )
+    trainer.parallel = SimpleNamespace(
+        cp=SimpleNamespace(size=2),
+        tp=SimpleNamespace(size=2),
+    )
+    batch = {"input_ids": torch.zeros(2, 3, dtype=torch.long)}
+    with pytest.raises(ValueError, match="differs from model.seq_length"):
+        trainer._validate_runtime_sequence(batch)
+
+    trainer.config.pipeline.dynamic_activation_shapes = True
+    trainer.config.parallel.sequence_parallel = True
+    with pytest.raises(ValueError, match="divisible by TP"):
+        trainer._validate_runtime_sequence(batch)

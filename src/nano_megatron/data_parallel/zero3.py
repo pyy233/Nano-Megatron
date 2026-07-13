@@ -36,6 +36,7 @@ class Zero3Strategy(DataParallelStrategy):
         self.trace: list[str] = []
         self._domain_parameters: list[DomainParameter] = []
         self._norm_metadata: dict[str, DomainParameter] = {}
+        self._fsdp_units: tuple[nn.Module, ...] = ()
 
     @property
     def checkpoint_domain(self) -> ParameterDomain:
@@ -130,8 +131,24 @@ class Zero3Strategy(DataParallelStrategy):
             options["offload_policy"] = CPUOffloadPolicy(
                 pin_memory=self.offload_policy.pin_memory,
             )
+        sharding_units = getattr(model, "sharding_units", None)
+        explicit_units: tuple[nn.Module, ...] | None = None
+        if callable(sharding_units):
+            explicit_units = tuple(sharding_units())
+            if not explicit_units:
+                raise ValueError("ZeRO-3 sharding_units() must return at least one module")
+            if any(not isinstance(unit, nn.Module) for unit in explicit_units):
+                raise TypeError("ZeRO-3 sharding_units() must return only nn.Module instances")
+
         try:
-            sharded_model = fully_shard(model, **options)
+            if explicit_units is None:
+                sharded_model = fully_shard(model, **options)
+                fsdp_units = (sharded_model,)
+            else:
+                for unit in explicit_units:
+                    fully_shard(unit, **options)
+                sharded_model = model
+                fsdp_units = explicit_units
         except (RuntimeError, TypeError, ValueError) as error:
             raise RuntimeError(
                 "FSDP2 fully_shard setup failed; verify PyTorch >=2.6 and that the "
@@ -139,6 +156,7 @@ class Zero3Strategy(DataParallelStrategy):
             ) from error
 
         self._model = sharded_model
+        self._fsdp_units = fsdp_units
         self._domain_parameters = [
             DomainParameter(
                 name=name,
@@ -156,10 +174,22 @@ class Zero3Strategy(DataParallelStrategy):
         return sharded_model
 
     @contextmanager
-    def microbatch_context(self, *, is_last_microbatch: bool) -> Iterator[None]:
+    def microbatch_context(
+        self,
+        *,
+        is_last_microbatch: bool,
+        unit: nn.Module | None = None,
+    ) -> Iterator[None]:
         previous = self._sync_this_backward
         self._sync_this_backward = is_last_microbatch
-        set_sync = getattr(self.model, "set_requires_gradient_sync", None)
+        if (
+            self.uses_fsdp2
+            and unit is not None
+            and all(unit is not candidate for candidate in self._fsdp_units)
+        ):
+            raise ValueError("ZeRO-3 microbatch unit is not one of the fully-sharded modules")
+        sync_unit = self.model if unit is None else unit
+        set_sync = getattr(sync_unit, "set_requires_gradient_sync", None)
         if self.uses_fsdp2 and callable(set_sync):
             set_sync(is_last_microbatch, recurse=True)
             self.trace.append(f"gradient_sync:{is_last_microbatch}")

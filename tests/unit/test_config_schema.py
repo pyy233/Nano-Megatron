@@ -220,20 +220,93 @@ def test_all_rank_order_permutations_are_accepted() -> None:
         assert ParallelConfig(data=1, order=order).order[0].value == order[0]
 
 
-def test_validation_rejects_declared_but_unimplemented_async_options() -> None:
+def test_validation_accepts_gradient_overlap_and_async_checkpoint() -> None:
     config = small_config(
         data_parallel=DataParallelConfig(overlap_grad_reduce=True),
-        pipeline=PipelineConfig(overlap_p2p=True),
+        pipeline=PipelineConfig(schedule="gpipe", overlap_p2p=True),
         checkpoint=CheckpointConfig(async_save=True),
     )
 
-    with pytest.raises(ConfigValidationError) as captured:
-        validate_config(config, world_size=1)
+    result = validate_config(config, world_size=1)
+    assert any("size-one replica" in warning for warning in result.warnings)
+    assert any("parallel.pipeline=1" in warning for warning in result.warnings)
 
-    message = str(captured.value)
-    assert "overlap_grad_reduce" in message
-    assert "overlap_p2p" in message
-    assert "async_save" in message
+
+def test_validation_accepts_p2p_overlap_for_non_interleaved_1f1b() -> None:
+    config = small_config(
+        parallel=ParallelConfig(pipeline=2, data=1),
+        pipeline=PipelineConfig(schedule="1f1b", overlap_p2p=True),
+    )
+
+    validate_config(config, world_size=2)
+
+
+def test_validation_accepts_interleaved_virtual_pipeline() -> None:
+    config = small_config(
+        parallel=ParallelConfig(pipeline=2, data=1),
+        model=GPTConfig(
+            layers=4,
+            hidden_size=16,
+            ffn_hidden_size=32,
+            heads=4,
+            kv_heads=2,
+            seq_length=8,
+            vocab_size=17,
+        ),
+        pipeline=PipelineConfig(
+            schedule="interleaved_1f1b",
+            overlap_p2p=True,
+            virtual_stages_per_rank=2,
+            dynamic_activation_shapes=True,
+        ),
+        training=TrainingConfig(gradient_accumulation_steps=2),
+    )
+
+    validate_config(config, world_size=2)
+
+
+@pytest.mark.parametrize(
+    ("pipeline", "training", "message"),
+    [
+        (
+            PipelineConfig(schedule="interleaved_1f1b"),
+            TrainingConfig(gradient_accumulation_steps=2),
+            "virtual_stages_per_rank",
+        ),
+        (
+            PipelineConfig(schedule="gpipe", virtual_stages_per_rank=2),
+            TrainingConfig(gradient_accumulation_steps=2),
+            "requires schedule=interleaved_1f1b",
+        ),
+        (
+            PipelineConfig(schedule="interleaved_1f1b", virtual_stages_per_rank=2),
+            TrainingConfig(gradient_accumulation_steps=3),
+            "divisible by parallel.pipeline",
+        ),
+    ],
+)
+def test_validation_rejects_invalid_virtual_pipeline_contracts(
+    pipeline: PipelineConfig,
+    training: TrainingConfig,
+    message: str,
+) -> None:
+    config = small_config(
+        parallel=ParallelConfig(pipeline=2, data=1),
+        model=GPTConfig(
+            layers=4,
+            hidden_size=16,
+            ffn_hidden_size=32,
+            heads=4,
+            kv_heads=2,
+            seq_length=8,
+            vocab_size=17,
+        ),
+        pipeline=pipeline,
+        training=training,
+    )
+
+    with pytest.raises(ConfigValidationError, match=message):
+        validate_config(config, world_size=2)
 
 
 def test_checkpoint_save_interval_zero_disables_periodic_saves() -> None:

@@ -39,6 +39,8 @@ data_parallel:
 pipeline:
   schedule: gpipe
   overlap_p2p: false
+  virtual_stages_per_rank: 1
+  dynamic_activation_shapes: false
 
 context_parallel:
   backend: all_gather

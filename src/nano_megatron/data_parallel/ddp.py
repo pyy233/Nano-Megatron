@@ -17,7 +17,7 @@ from ._common import (
     scale_parameter_gradients,
     unique_process_groups,
 )
-from .buckets import FlatBucket, build_flat_buckets
+from .buckets import BucketGradientReducer, FlatBucket, build_flat_buckets
 from .interface import DataParallelStrategy
 
 if TYPE_CHECKING:
@@ -25,12 +25,14 @@ if TYPE_CHECKING:
 
 
 class DDPStrategy(DataParallelStrategy):
-    """Readable replicated-data parallelism with one explicit final all-reduce.
+    """Readable replicated-data parallelism with explicit bucket reductions.
 
     Native DDP's ``no_sync`` context must span each matching forward/backward
     graph, which is awkward for GPipe's reverse drain and 1F1B's interleaving.
     A manual flat-bucket path keeps accumulation, pipeline, tied embeddings,
-    parameter domains, and reduction dtype correct with one visible lifecycle.
+    parameter domains, and reduction dtype correct with one visible lifecycle;
+    optional post-accumulate hooks start each ordered reduction as soon as its
+    final-microbatch gradients are ready.
     """
 
     mode = "ddp"
@@ -42,6 +44,7 @@ class DDPStrategy(DataParallelStrategy):
         self._manual_gradients_synchronized = False
         self.gradient_sync_count = 0
         self._domain_parameters = []
+        self.gradient_reducer: BucketGradientReducer | None = None
 
     def setup(
         self,
@@ -62,6 +65,13 @@ class DDPStrategy(DataParallelStrategy):
             bucket_bytes=int(config_value(self.config, "bucket_bytes", 256 * 1024**2)),
         )
         self._broadcast_manual_parameters()
+        self.gradient_reducer = BucketGradientReducer(
+            self._buckets,
+            partition_gradients=False,
+            reduction_dtype=self.grad_reduce_dtype,
+            overlap=bool(config_value(self.config, "overlap_grad_reduce", False)),
+            is_final_backward=lambda: self._sync_this_backward,
+        )
         wrapped: nn.Module = model
 
         self._model = wrapped
@@ -89,8 +99,9 @@ class DDPStrategy(DataParallelStrategy):
             self._synchronize_manual_gradients()
 
     def _synchronize_manual_gradients(self) -> None:
-        for bucket in self._buckets:
-            bucket.all_reduce_gradient(dtype=self.grad_reduce_dtype)
+        if self.gradient_reducer is None:
+            raise RuntimeError("DDPStrategy.setup() must be called before gradient reduction")
+        self.gradient_reducer.finalize()
         self._manual_gradients_synchronized = True
         self.gradient_sync_count += 1
 
@@ -114,6 +125,9 @@ class DDPStrategy(DataParallelStrategy):
     def zero_grad(self) -> None:
         if self.optimizer is None:
             raise RuntimeError("DDPStrategy.setup() must be called before zero_grad()")
+        if self.gradient_reducer is None:
+            raise RuntimeError("DDPStrategy.setup() must be called before zero_grad()")
+        self.gradient_reducer.reset()
         self.optimizer.zero_grad(set_to_none=True)
         for bucket in self._buckets:
             bucket.clear_gradients()
