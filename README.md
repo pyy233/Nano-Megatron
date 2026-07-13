@@ -2,9 +2,6 @@
 
 一个以可读性和可验证性为优先的 mini Megatron 教学实现。
 
-- [第一阶段 GPT 架构设计](docs/architecture.md)
-- [Megatron-LM 源码架构对比](docs/megatron-comparison.md)
-
 ## 当前实现边界
 
 - 已在 CPU/Gloo 上验证 GPT、TP/SP、PP、CP、EP topology、DDP/ZeRO-1/2/3、
