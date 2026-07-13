@@ -9,8 +9,6 @@ from typing import Any
 import torch
 from torch import Tensor
 
-from ..stage import LossOutput, as_loss_output
-
 
 def data_parallel_context(strategy: Any, *, is_last_microbatch: bool):
     if strategy is None or not hasattr(strategy, "microbatch_context"):
@@ -82,13 +80,12 @@ def backward(strategy: Any, loss_or_output: Tensor, gradient: Tensor | None = No
         loss_or_output.backward()
 
 
-def extract_loss(value: Tensor | LossOutput, divisor: int) -> tuple[Tensor, dict[str, float]]:
-    result = as_loss_output(value)
-    metrics = {
-        name: float(metric.detach().cpu()) if isinstance(metric, Tensor) else float(metric)
-        for name, metric in result.metrics.items()
-    }
-    return result.loss / divisor, metrics
+def extract_loss(value: Tensor, divisor: int) -> tuple[Tensor, dict[str, float]]:
+    if not isinstance(value, Tensor):
+        raise TypeError("pipeline stages must return a Tensor")
+    if value.ndim != 0:
+        raise TypeError("the last pipeline stage must return a scalar loss Tensor")
+    return value / divisor, {"loss": float(value.detach().cpu())}
 
 
 def accumulate_metrics(

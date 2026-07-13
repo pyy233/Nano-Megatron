@@ -104,6 +104,38 @@ def communication_is_active(group: ParallelGroup) -> bool:
     return group_size(group) > 1 and dist.is_available() and dist.is_initialized()
 
 
+def _scalar_collective_device(
+    group: ParallelGroup,
+    parallel: ParallelContext,
+    fallback: torch.device,
+) -> torch.device:
+    backend = str(group.backend).lower()
+    if backend == "nccl":
+        device = torch.device(parallel.runtime.device)
+        if device.type != "cuda":
+            raise RuntimeError("an NCCL norm reduction requires a CUDA runtime device")
+        return device
+    if backend == "gloo":
+        return torch.device("cpu")
+    return fallback
+
+
+def _all_reduce_squared_norm(
+    squared: Tensor,
+    group: ParallelGroup,
+    parallel: ParallelContext,
+) -> Tensor:
+    if not communication_is_active(group):
+        return squared
+    reduced = squared.to(_scalar_collective_device(group, parallel, squared.device))
+    dist.all_reduce(
+        reduced,
+        op=dist.ReduceOp.SUM,
+        group=process_group(group),
+    )
+    return reduced
+
+
 def parameter_contributes_to_model_norm(
     item: DomainParameter,
     parallel: ParallelContext,
@@ -135,12 +167,7 @@ def reduce_model_parallel_squared_norm(
     """Sum unique TP/EP shards and PP stages for one CP/DP replica."""
 
     for group in (parallel.group(GroupKey.TP_EP), parallel.pp):
-        if communication_is_active(group):
-            dist.all_reduce(
-                squared,
-                op=dist.ReduceOp.SUM,
-                group=process_group(group),
-            )
+        squared = _all_reduce_squared_norm(squared, group, parallel)
     return squared
 
 
@@ -182,17 +209,13 @@ def global_parameter_grad_norm(
 
     if replica_sharded:
         for group, domain, group_squared in by_replica_group.values():
-            if communication_is_active(group):
-                dist.all_reduce(
-                    group_squared,
-                    op=dist.ReduceOp.SUM,
-                    group=process_group(group),
-                )
+            group_squared = _all_reduce_squared_norm(group_squared, group, parallel)
             if domain is ParameterDomain.DENSE and parallel.ep.rank != 0:
                 group_squared.zero_()
             local_total.add_(group_squared.to(local_total.device))
-    reduce_model_parallel_squared_norm(local_total, parallel)
-    return local_total.sqrt()
+    result_device = local_total.device
+    local_total = reduce_model_parallel_squared_norm(local_total, parallel)
+    return local_total.to(result_device).sqrt()
 
 
 def scale_parameter_gradients(parameters: Iterable[DomainParameter], coefficient: Tensor) -> None:

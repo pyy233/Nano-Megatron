@@ -21,7 +21,7 @@ from nano_megatron.config import (
 from nano_megatron.data_parallel import build_data_parallel_strategy
 from nano_megatron.distributed import DistributedRuntime
 from nano_megatron.parallel import ParallelContext, ParameterDomain, ParameterDomainRegistry
-from nano_megatron.pipeline_parallel import GPipeSchedule, LossOutput
+from nano_megatron.pipeline_parallel import GPipeSchedule
 
 
 class _SingleStageParallel:
@@ -41,7 +41,7 @@ class _RegressionStage(nn.Module):
 
     def forward(self, hidden_states, batch):
         del hidden_states
-        return LossOutput(self.projection(batch["input"]).square().mean())
+        return self.projection(batch["input"]).square().mean()
 
 
 def _zero_worker(rank: int, world_size: int, rendezvous: str, mode: str) -> None:
@@ -225,7 +225,7 @@ def _ddp_accumulation_worker(rank: int, world_size: int, rendezvous: str) -> Non
                     [[replica_rank + index + 1.0, 0.5 * (index + 1)]],
                     dtype=torch.float32,
                 )
-                reference(None, {"input": value}).loss.div_(3 * world_size).backward()
+                reference(None, {"input": value}).div_(3 * world_size).backward()
         reference_optimizer.step()
 
         assert strategy.gradient_sync_count == 1

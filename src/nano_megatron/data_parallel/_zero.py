@@ -137,8 +137,9 @@ class FlatShardZeROStrategy(DataParallelStrategy):
             return torch.zeros((), device=self.buckets[0].device)
         values = [value.to(self.buckets[0].device) for value in squared_norms]
         total_squared = torch.stack(values).sum()
-        reduce_model_parallel_squared_norm(total_squared, self.parallel)
-        total_norm = total_squared.sqrt()
+        result_device = total_squared.device
+        total_squared = reduce_model_parallel_squared_norm(total_squared, self.parallel)
+        total_norm = total_squared.to(result_device).sqrt()
         if max_norm > 0:
             coefficient = torch.clamp(max_norm / (total_norm + 1.0e-6), max=1.0)
             for bucket in self.buckets:

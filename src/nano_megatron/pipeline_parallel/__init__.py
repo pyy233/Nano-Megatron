@@ -7,12 +7,11 @@ from .schedules import (
     OneForwardOneBackwardSchedule,
     prepare_pipeline_stage,
 )
-from .stage import LossOutput, PipelineStage, StepOutput
+from .stage import PipelineStage, StepOutput
 
 __all__ = [
     "GPipeSchedule",
     "LayerPartition",
-    "LossOutput",
     "OneForwardOneBackwardSchedule",
     "P2PCommunicator",
     "PipelineStage",

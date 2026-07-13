@@ -87,10 +87,15 @@ class P2PCommunicator:
     def send_forward(self, tensor: Tensor) -> None:
         peer = self._next_rank()
         if peer is not None:
-            dist.send(
-                self._wire_tensor(tensor, name="forward tensor"),
-                dst=peer,
-                group=_raw_group(self.group),
+            self._run_ops(
+                [
+                    dist.P2POp(
+                        dist.isend,
+                        self._wire_tensor(tensor, name="forward tensor"),
+                        peer,
+                        _raw_group(self.group),
+                    )
+                ]
             )
 
     def recv_forward(self) -> Tensor | None:
@@ -98,16 +103,21 @@ class P2PCommunicator:
         if peer is None:
             return None
         tensor = self._empty_activation()
-        dist.recv(tensor, src=peer, group=_raw_group(self.group))
+        self._run_ops([dist.P2POp(dist.irecv, tensor, peer, _raw_group(self.group))])
         return tensor.detach().requires_grad_(True)
 
     def send_backward(self, gradient: Tensor) -> None:
         peer = self._prev_rank()
         if peer is not None:
-            dist.send(
-                self._wire_tensor(gradient, name="backward gradient"),
-                dst=peer,
-                group=_raw_group(self.group),
+            self._run_ops(
+                [
+                    dist.P2POp(
+                        dist.isend,
+                        self._wire_tensor(gradient, name="backward gradient"),
+                        peer,
+                        _raw_group(self.group),
+                    )
+                ]
             )
 
     def recv_backward(self) -> Tensor | None:
@@ -115,7 +125,7 @@ class P2PCommunicator:
         if peer is None:
             return None
         gradient = self._empty_activation()
-        dist.recv(gradient, src=peer, group=_raw_group(self.group))
+        self._run_ops([dist.P2POp(dist.irecv, gradient, peer, _raw_group(self.group))])
         return gradient
 
     def send_forward_recv_backward(self, output: Tensor) -> Tensor | None:

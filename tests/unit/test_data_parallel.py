@@ -22,6 +22,7 @@ from nano_megatron.data_parallel import (
     Zero3Strategy,
     build_data_parallel_strategy,
 )
+from nano_megatron.data_parallel._common import _scalar_collective_device
 from nano_megatron.distributed import DistributedRuntime
 from nano_megatron.parallel import ParallelContext, ParameterDomain, ParameterDomainRegistry
 
@@ -36,6 +37,23 @@ def _registered(model: nn.Module) -> ParameterDomainRegistry:
     registry = ParameterDomainRegistry()
     registry.register_module(model, ParameterDomain.DENSE)
     return registry
+
+
+def test_norm_scalar_collective_device_follows_the_explicit_backend() -> None:
+    parallel = SimpleNamespace(runtime=SimpleNamespace(device=torch.device("cuda", 1)))
+    nccl_group = SimpleNamespace(backend="nccl")
+    gloo_group = SimpleNamespace(backend="gloo")
+
+    assert _scalar_collective_device(
+        nccl_group,
+        parallel,
+        torch.device("cpu"),
+    ) == torch.device("cuda", 1)
+    assert _scalar_collective_device(
+        gloo_group,
+        parallel,
+        torch.device("cuda", 1),
+    ) == torch.device("cpu")
 
 
 @pytest.mark.parametrize(

@@ -6,7 +6,6 @@ torch = pytest.importorskip("torch")
 
 from nano_megatron.pipeline_parallel import (  # noqa: E402
     GPipeSchedule,
-    LossOutput,
     OneForwardOneBackwardSchedule,
     P2PCommunicator,
     StepOutput,
@@ -82,8 +81,7 @@ def test_gpipe_wraps_forward_in_activation_offload_context() -> None:
 
         def forward(self, hidden_states, batch):
             del hidden_states
-            loss = self.weight * batch["value"]
-            return LossOutput(loss)
+            return self.weight * batch["value"]
 
     class Strategy:
         def __init__(self) -> None:
@@ -123,7 +121,7 @@ def test_step_output_sums_already_scaled_microbatch_losses() -> None:
     assert output.loss.item() == pytest.approx(3.0)
 
 
-def test_gpipe_averages_metrics_over_microbatches() -> None:
+def test_gpipe_reports_average_loss_metric_over_microbatches() -> None:
     class Parallel:
         @staticmethod
         def is_pipeline_first_stage() -> bool:
@@ -136,15 +134,64 @@ def test_gpipe_averages_metrics_over_microbatches() -> None:
     class Stage:
         def __call__(self, hidden_states, batch):
             del hidden_states
-            value = batch["value"]
-            return LossOutput(value, {"value": value})
+            return batch["value"]
 
     output = GPipeSchedule(Parallel()).forward_backward(
         stage=Stage(),
         microbatches=[{"value": torch.tensor(1.0)}, {"value": torch.tensor(3.0)}],
         forward_only=True,
     )
-    assert output.metrics["value"] == pytest.approx(2.0)
+    assert output.metrics["loss"] == pytest.approx(2.0)
+
+
+def test_gpipe_rejects_structured_outputs_at_the_sharding_boundary() -> None:
+    class Parallel:
+        @staticmethod
+        def is_pipeline_first_stage() -> bool:
+            return True
+
+        @staticmethod
+        def is_pipeline_last_stage() -> bool:
+            return True
+
+    class StructuredOutput:
+        def __init__(self, loss):
+            self.loss = loss
+
+    class Stage:
+        def __call__(self, hidden_states, batch):
+            del hidden_states
+            return StructuredOutput(batch["value"])
+
+    with pytest.raises(TypeError, match="pipeline stages must return a Tensor"):
+        GPipeSchedule(Parallel()).forward_backward(
+            stage=Stage(),
+            microbatches=[{"value": torch.tensor(1.0)}],
+            forward_only=True,
+        )
+
+
+def test_gpipe_requires_a_scalar_loss_from_the_last_stage() -> None:
+    class Parallel:
+        @staticmethod
+        def is_pipeline_first_stage() -> bool:
+            return True
+
+        @staticmethod
+        def is_pipeline_last_stage() -> bool:
+            return True
+
+    class Stage:
+        def __call__(self, hidden_states, batch):
+            del hidden_states
+            return batch["value"]
+
+    with pytest.raises(TypeError, match="last pipeline stage must return a scalar loss Tensor"):
+        GPipeSchedule(Parallel()).forward_backward(
+            stage=Stage(),
+            microbatches=[{"value": torch.ones(2)}],
+            forward_only=True,
+        )
 
 
 def test_cpu_bfloat16_compute_context_autocasts_linear_output() -> None:

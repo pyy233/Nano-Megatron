@@ -23,7 +23,7 @@ from nano_megatron.parallel import (
     ParallelRNG,
     ParameterDomain,
 )
-from nano_megatron.pipeline_parallel import LossOutput, partition_for_rank
+from nano_megatron.pipeline_parallel import partition_for_rank
 
 
 @dataclass(frozen=True)
@@ -189,9 +189,8 @@ def test_single_stage_pipeline_wrapper_unpacks_batch_and_returns_loss() -> None:
         "labels": torch.randint(0, config.vocab_size, (2, config.seq_length)),
     }
     output = built.model(None, batch)
-    assert isinstance(output, LossOutput)
-    assert output.loss.ndim == 0
-    assert "loss" in output.metrics
+    assert isinstance(output, torch.Tensor)
+    assert output.ndim == 0
 
 
 def test_kernel_backend_factory_builds_torch_reference() -> None:

@@ -13,7 +13,6 @@ from torch import Tensor, nn
 from nano_megatron.parallel import GroupKey, ParallelGroup
 from nano_megatron.pipeline_parallel import (
     GPipeSchedule,
-    LossOutput,
     OneForwardOneBackwardSchedule,
     P2PCommunicator,
 )
@@ -43,7 +42,7 @@ class _ScalarStage(nn.Module):
         self.world_size = world_size
         self.weight = nn.Parameter(torch.tensor(initial_weight, dtype=torch.float64))
 
-    def forward(self, hidden_states: Tensor | None, batch) -> Tensor | LossOutput:
+    def forward(self, hidden_states: Tensor | None, batch) -> Tensor:
         if self.rank == 0:
             assert hidden_states is None
             return batch["x"] * self.weight
@@ -51,8 +50,7 @@ class _ScalarStage(nn.Module):
         output = hidden_states * self.weight
         if self.rank != self.world_size - 1:
             return output
-        loss = (output - batch["target"]).square().mean()
-        return LossOutput(loss, {"loss": loss.detach()})
+        return (output - batch["target"]).square().mean()
 
 
 def _expected_gradients(microbatches: list[dict[str, Tensor]], weights: tuple[float, ...]):

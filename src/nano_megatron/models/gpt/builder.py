@@ -12,7 +12,7 @@ from nano_megatron.models.gpt.factory import DenseGPTComponents, GPTComponentFac
 from nano_megatron.models.gpt.model import GPTModel
 from nano_megatron.models.gpt.tied_embeddings import TiedEmbeddingSynchronizer
 from nano_megatron.parallel import GroupKey, ParameterDomain, ParameterDomainRegistry
-from nano_megatron.pipeline_parallel import LayerPartition, LossOutput, partition_for_rank
+from nano_megatron.pipeline_parallel import LayerPartition, partition_for_rank
 from nano_megatron.tensor_parallel import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -199,7 +199,7 @@ class GPTPipelineStage(nn.Module):
             self._refresh_tied_embedding_weight()
             self.tied_embeddings.synchronize_gradient()
 
-    def forward(self, hidden_states: Tensor | None, batch: Any) -> Tensor | LossOutput:
+    def forward(self, hidden_states: Tensor | None, batch: Any) -> Tensor:
         input_ids = _batch_value(batch, "input_ids") if self.partition.owns_embedding else None
         labels = _batch_value(batch, "labels", None) if self.partition.owns_lm_head else None
         position_ids = _batch_value(batch, "position_ids", None)
@@ -215,4 +215,4 @@ class GPTPipelineStage(nn.Module):
             return output.hidden_states
         if output.loss is None:
             raise ValueError("the last GPT pipeline stage requires batch['labels']")
-        return LossOutput(output.loss, {"loss": output.loss.detach()})
+        return output.loss
