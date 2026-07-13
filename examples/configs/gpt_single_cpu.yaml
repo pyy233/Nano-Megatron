@@ -1,0 +1,78 @@
+distributed:
+  backend: gloo
+  device: cpu
+
+parallel:
+  tensor: 1
+  pipeline: 1
+  context: 1
+  expert: 1
+  data: 1
+  order: [tp, cp, ep, dp, pp]
+  sequence_parallel: false
+
+model:
+  layers: 2
+  hidden_size: 64
+  ffn_hidden_size: 128
+  heads: 4
+  kv_heads: 4
+  seq_length: 32
+  vocab_size: 256
+  dropout: 0.0
+  tie_embeddings: true
+
+precision:
+  params: float32
+  compute: float32
+  grad_reduce: float32
+
+kernels:
+  backend: torch
+
+data_parallel:
+  mode: ddp
+  bucket_bytes: 1048576
+  overlap_grad_reduce: false
+  reshard_after_forward: true
+
+pipeline:
+  schedule: gpipe
+  overlap_p2p: false
+
+context_parallel:
+  backend: all_gather
+  dropout: 0.0
+
+activation_checkpoint:
+  mode: none
+
+offload:
+  optimizer_state: false
+  zero3_params_and_grads: false
+  activations: false
+
+optimizer:
+  name: adamw
+  lr: 0.001
+  weight_decay: 0.0
+  clip_grad_norm: 1.0
+
+training:
+  micro_batch_size: 2
+  gradient_accumulation_steps: 2
+  max_steps: 2
+  seed: 1234
+  log_interval: 1
+
+checkpoint:
+  directory: checkpoints/gpt_single_cpu
+  save_interval: 100
+  async_save: false
+  keep_last: 2
+
+data:
+  path: null
+  num_workers: 0
+  shuffle: true
+  packed_sequences: false

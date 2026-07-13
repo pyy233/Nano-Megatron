@@ -1,0 +1,42 @@
+[project]
+name = "nano-megatron"
+version = "0.1.0"
+description = "A readable, explicitly-wired mini Megatron training framework"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "PyYAML>=6.0.2",
+    "torch>=2.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.11",
+]
+
+[project.scripts]
+nano-megatron-train = "nano_megatron.cli.train:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nano_megatron"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+markers = [
+    "distributed: requires a multi-process torch.distributed launch",
+    "gpu: requires CUDA/NCCL and is not run on CPU-only development machines",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

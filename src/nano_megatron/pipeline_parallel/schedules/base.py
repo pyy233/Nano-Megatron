@@ -1,0 +1,105 @@
+"""Shared helpers for pipeline schedules."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
+from typing import Any
+
+import torch
+from torch import Tensor
+
+from ..stage import LossOutput, as_loss_output
+
+
+def data_parallel_context(strategy: Any, *, is_last_microbatch: bool):
+    if strategy is None or not hasattr(strategy, "microbatch_context"):
+        return nullcontext()
+    return strategy.microbatch_context(is_last_microbatch=is_last_microbatch)
+
+
+def activation_context(strategy: Any):
+    if strategy is None or not hasattr(strategy, "activation_context"):
+        return nullcontext()
+    return strategy.activation_context()
+
+
+def forward_data_parallel_context(strategy: Any, *, synchronize_gradients: bool):
+    if strategy is None:
+        return nullcontext()
+    context = getattr(strategy, "forward_microbatch_context", None)
+    if callable(context):
+        return context(synchronize_gradients=synchronize_gradients)
+    return activation_context(strategy)
+
+
+ComputeContext = Callable[[], AbstractContextManager[Any]]
+
+
+def no_compute_context() -> AbstractContextManager[None]:
+    return nullcontext()
+
+
+def match_output_gradient(output: Tensor, gradient: Tensor | None) -> Tensor | None:
+    if gradient is None:
+        return None
+    if gradient.shape != output.shape:
+        raise ValueError(
+            f"pipeline gradient shape {tuple(gradient.shape)} does not match output "
+            f"shape {tuple(output.shape)}"
+        )
+    return gradient.to(device=output.device, dtype=output.dtype)
+
+
+def _stage_hook(stage: Any, name: str) -> None:
+    """Call an optional pipeline lifecycle hook through common wrappers."""
+
+    current = stage
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        hook = getattr(current, name, None)
+        if callable(hook):
+            hook()
+            return
+        current = getattr(current, "module", None)
+
+
+def prepare_pipeline_stage(stage: Any) -> None:
+    _stage_hook(stage, "synchronize_tied_embedding_weights")
+
+
+def finalize_pipeline_stage_gradients(stage: Any) -> None:
+    _stage_hook(stage, "synchronize_tied_embedding_gradients")
+
+
+def backward(strategy: Any, loss_or_output: Tensor, gradient: Tensor | None = None) -> None:
+    if gradient is not None:
+        torch.autograd.backward(loss_or_output, gradient)
+    elif strategy is not None and hasattr(strategy, "backward"):
+        strategy.backward(loss_or_output)
+    else:
+        loss_or_output.backward()
+
+
+def extract_loss(value: Tensor | LossOutput, divisor: int) -> tuple[Tensor, dict[str, float]]:
+    result = as_loss_output(value)
+    metrics = {
+        name: float(metric.detach().cpu()) if isinstance(metric, Tensor) else float(metric)
+        for name, metric in result.metrics.items()
+    }
+    return result.loss / divisor, metrics
+
+
+def accumulate_metrics(
+    sums: dict[str, float],
+    counts: dict[str, int],
+    metrics: dict[str, float],
+) -> None:
+    for name, value in metrics.items():
+        sums[name] = sums.get(name, 0.0) + value
+        counts[name] = counts.get(name, 0) + 1
+
+
+def average_metrics(sums: dict[str, float], counts: dict[str, int]) -> dict[str, float]:
+    return {name: value / counts[name] for name, value in sums.items()}
