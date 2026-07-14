@@ -9,10 +9,38 @@ from nano_megatron.training.trainer import _number_microbatches  # noqa: E402
 
 
 def test_trainer_state_round_trip() -> None:
-    state = TrainerState(step=3, consumed_samples=48, consumed_tokens=96)
+    state = TrainerState(
+        step=3,
+        consumed_samples=48,
+        consumed_tokens=96,
+        data_fingerprint="corpus-v1",
+    )
     restored = TrainerState()
     restored.load_state_dict(state.state_dict())
     assert restored == state
+
+
+def test_bind_data_iterator_rejects_checkpoint_data_identity_change() -> None:
+    trainer = object.__new__(Trainer)
+    trainer.state = TrainerState(data_fingerprint="original")
+    trainer.data_iterator = None
+
+    with pytest.raises(RuntimeError, match="does not match the checkpoint"):
+        trainer.bind_data_iterator(iter([1]), data_fingerprint="replacement")
+
+    with pytest.raises(RuntimeError, match="rebinding requires"):
+        trainer.bind_data_iterator(iter([1]))
+
+    trainer.bind_data_iterator(iter([2]), data_fingerprint="original")
+    assert next(trainer.data_iterator) == 2
+
+
+def test_fit_cannot_bypass_checkpoint_data_fingerprint_with_inline_data() -> None:
+    trainer = object.__new__(Trainer)
+    trainer.state = TrainerState(data_fingerprint="original")
+
+    with pytest.raises(RuntimeError, match="bind_data_iterator"):
+        trainer.fit(["unverified"], max_steps=1)
 
 
 def test_restore_data_position_skips_completed_optimizer_steps() -> None:
@@ -81,9 +109,9 @@ def test_runtime_sequence_validation_supports_dynamic_lengths() -> None:
         tp=SimpleNamespace(size=1),
     )
 
-    assert trainer._validate_runtime_sequence(
-        {"input_ids": torch.zeros(2, 3, dtype=torch.long)}
-    ) == 6
+    assert (
+        trainer._validate_runtime_sequence({"input_ids": torch.zeros(2, 3, dtype=torch.long)}) == 6
+    )
 
 
 def test_runtime_sequence_validation_rejects_static_or_invalid_sp_shapes() -> None:

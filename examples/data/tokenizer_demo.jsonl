@@ -1,0 +1,12 @@
+{"text":"Once upon a time, a little fox found a bright red lantern beside the river."}
+{"text":"The fox carried the lantern home and shared its warm light with three friends."}
+{"text":"A small blue bird sang in the old oak tree while rain tapped on every leaf."}
+{"text":"Mina opened the wooden gate, waved to her brother, and ran toward the garden."}
+{"text":"The garden had yellow flowers, green grass, smooth stones, and one sleepy rabbit."}
+{"text":"你好，世界。小猫坐在窗边听雨，然后轻轻地说：明天见。"}
+{"text":"字节级分词器可以保留中文、标点、空格和换行。"}
+{"text":"Emoji remain exact bytes too: 🐍🚀✨ 👋, even beside punctuation!"}
+{"text":"Whitespace survives round trips:\n\nsecond paragraph\twith a tab."}
+{"text":"Numbers such as 12345 and symbols such as @#$% are ordinary text."}
+{"text":"A decoder should reconstruct every byte without silently normalizing the input."}
+{"text":"Training data can be small for a smoke test, deterministic, and easy to inspect."}

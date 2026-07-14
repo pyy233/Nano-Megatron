@@ -113,18 +113,24 @@ class TrainerState:
     step: int = 0
     consumed_samples: int = 0
     consumed_tokens: int = 0
+    data_fingerprint: str | None = None
 
-    def state_dict(self) -> dict[str, int]:
+    def state_dict(self) -> dict[str, int | str | None]:
         return {
             "step": self.step,
             "consumed_samples": self.consumed_samples,
             "consumed_tokens": self.consumed_tokens,
+            "data_fingerprint": self.data_fingerprint,
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
         self.step = int(state.get("step", 0))
         self.consumed_samples = int(state.get("consumed_samples", 0))
         self.consumed_tokens = int(state.get("consumed_tokens", 0))
+        fingerprint = state.get("data_fingerprint")
+        if fingerprint is not None and (not isinstance(fingerprint, str) or not fingerprint):
+            raise ValueError("trainer data_fingerprint must be a non-empty string or null")
+        self.data_fingerprint = fingerprint
 
 
 class Trainer:
@@ -167,6 +173,37 @@ class Trainer:
             prepare_pipeline_stage(model)
         self.model = model
         self.schedule = self._build_schedule()
+
+    def bind_data_iterator(
+        self,
+        data: Iterable[Any] | Iterator[Any],
+        *,
+        data_fingerprint: str | None = None,
+    ) -> None:
+        """Bind deterministic data and reject silent corpus/order changes on resume."""
+
+        if data_fingerprint is not None and (
+            not isinstance(data_fingerprint, str) or not data_fingerprint
+        ):
+            raise ValueError("data_fingerprint must be a non-empty string or null")
+        checkpoint_fingerprint = self.state.data_fingerprint
+        if checkpoint_fingerprint is not None and data_fingerprint is None:
+            raise RuntimeError(
+                "checkpoint contains a training data fingerprint; rebinding requires the "
+                "current data_fingerprint"
+            )
+        if (
+            checkpoint_fingerprint is not None
+            and data_fingerprint is not None
+            and checkpoint_fingerprint != data_fingerprint
+        ):
+            raise RuntimeError(
+                "training data fingerprint does not match the checkpoint: "
+                f"{data_fingerprint} != {checkpoint_fingerprint}"
+            )
+        if data_fingerprint is not None:
+            self.state.data_fingerprint = data_fingerprint
+        self.data_iterator = iter(data)
 
     def _pipeline_size(self) -> int:
         group = self.parallel.pp
@@ -314,6 +351,11 @@ class Trainer:
         *,
         max_steps: int | None = None,
     ) -> TrainerState:
+        if data is not None and self.state.data_fingerprint is not None:
+            raise RuntimeError(
+                "checkpointed training data must be rebound with bind_data_iterator() "
+                "so its fingerprint can be verified"
+            )
         iterator = iter(data) if data is not None else self.data_iterator
         if iterator is None:
             raise ValueError("Trainer.fit requires a data iterator")

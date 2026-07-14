@@ -1,0 +1,86 @@
+distributed:
+  backend: gloo
+  device: cpu
+
+parallel:
+  tensor: 1
+  pipeline: 1
+  context: 1
+  expert: 1
+  data: 1
+  order: [tp, cp, ep, dp, pp]
+  sequence_parallel: false
+
+model:
+  layers: 2
+  hidden_size: 128
+  ffn_hidden_size: 512
+  heads: 4
+  kv_heads: 4
+  seq_length: 128
+  vocab_size: 4096
+  dropout: 0.0
+  tie_embeddings: true
+
+precision:
+  params: float32
+  compute: float32
+  grad_reduce: float32
+
+kernels:
+  backend: torch
+
+data_parallel:
+  mode: ddp
+  bucket_bytes: 1048576
+  overlap_grad_reduce: false
+  reshard_after_forward: true
+
+pipeline:
+  schedule: gpipe
+  overlap_p2p: false
+  virtual_stages_per_rank: 1
+  dynamic_activation_shapes: false
+
+context_parallel:
+  backend: all_gather
+  dropout: 0.0
+
+activation_checkpoint:
+  mode: none
+
+offload:
+  optimizer_state: false
+  zero3_params_and_grads: false
+  activations: false
+
+optimizer:
+  name: adamw
+  lr: 0.0003
+  weight_decay: 0.1
+  clip_grad_norm: 1.0
+
+training:
+  micro_batch_size: 2
+  gradient_accumulation_steps: 2
+  max_steps: 20
+  seed: 1234
+  log_interval: 1
+
+checkpoint:
+  directory: checkpoints/gpt_tinystories_cpu
+  save_interval: 10
+  async_save: false
+  keep_last: 2
+
+data:
+  path: data/processed/tinystories-4k.pt
+  mmap_path: null
+  text_path: null
+  text_key: text
+  tokenizer:
+    path: data/tokenizers/tinystories-4k
+    append_eos: true
+  num_workers: 0
+  shuffle: true
+  packed_sequences: false

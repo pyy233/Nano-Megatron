@@ -129,8 +129,29 @@ def validate_config(
             f"({config.training.gradient_accumulation_steps}) < PP ({parallel.pipeline})"
         )
 
-    if parallel.context > 1 and config.data.packed_sequences:
-        errors.append("context parallelism does not support packed/document masks in phase one")
+    configured_data_sources = sum(
+        source is not None
+        for source in (config.data.path, config.data.mmap_path, config.data.text_path)
+    )
+    if configured_data_sources > 1:
+        errors.append(
+            "data.path, data.mmap_path, and data.text_path are mutually exclusive; "
+            "at most one may be set"
+        )
+    if config.data.text_path is not None and config.data.tokenizer is None:
+        errors.append("data.text_path requires data.tokenizer")
+    if (
+        config.data.tokenizer is not None
+        and config.data.path is None
+        and config.data.mmap_path is None
+        and config.data.text_path is None
+    ):
+        errors.append("data.tokenizer requires data.path, data.mmap_path, or data.text_path")
+    if config.data.packed_sequences:
+        errors.append(
+            "data.packed_sequences=true is not supported; document-aware attention masks "
+            "are not implemented"
+        )
     if parallel.context > 1 and model.dropout > 0.0:
         errors.append(
             "model.dropout must be 0 when context parallelism is enabled in phase one; "

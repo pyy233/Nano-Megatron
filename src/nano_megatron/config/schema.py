@@ -30,6 +30,16 @@ def _require_bool(name: str, value: bool) -> None:
         raise TypeError(f"{name} must be a boolean, got {value!r}")
 
 
+def _optional_path(name: str, value: str | Path | None) -> Path | None:
+    if value is None:
+        return None
+    if not isinstance(value, (str, Path)):
+        raise TypeError(f"{name} must be a filesystem path string or null")
+    if isinstance(value, str) and not value.strip():
+        raise ValueError(f"{name} must not be empty")
+    return Path(value)
+
+
 def _require_positive_float(name: str, value: float, *, allow_zero: bool = False) -> None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError(f"{name} must be a number, got {value!r}")
@@ -336,12 +346,8 @@ class PipelineConfig:
                 ),
             )
         _require_bool("pipeline.overlap_p2p", self.overlap_p2p)
-        _require_int(
-            "pipeline.virtual_stages_per_rank", self.virtual_stages_per_rank
-        )
-        _require_bool(
-            "pipeline.dynamic_activation_shapes", self.dynamic_activation_shapes
-        )
+        _require_int("pipeline.virtual_stages_per_rank", self.virtual_stages_per_rank)
+        _require_bool("pipeline.dynamic_activation_shapes", self.dynamic_activation_shapes)
 
 
 @dataclass(frozen=True, slots=True)
@@ -494,19 +500,53 @@ class CheckpointConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class TokenizerConfig:
+    """Reference a Nano-Megatron tokenizer artifact directory for training data."""
+
+    path: Path
+    append_eos: bool = True
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.path, (str, Path)):
+            raise TypeError("data.tokenizer.path must be a filesystem path string")
+        if isinstance(self.path, str) and not self.path.strip():
+            raise ValueError("data.tokenizer.path must not be empty")
+        object.__setattr__(self, "path", Path(self.path))
+        _require_bool("data.tokenizer.append_eos", self.append_eos)
+
+
+@dataclass(frozen=True, slots=True)
 class DataConfig:
+    """Select random data, a PT corpus, an mmap corpus, or raw JSONL."""
+
     path: Path | None = None
-    tokenizer: str | None = None
+    mmap_path: Path | None = None
+    text_path: Path | None = None
+    text_key: str = "text"
+    tokenizer: TokenizerConfig | None = None
     num_workers: int = 0
     shuffle: bool = True
     packed_sequences: bool = False
 
     def __post_init__(self) -> None:
-        if self.path is not None:
-            object.__setattr__(self, "path", Path(self.path))
+        object.__setattr__(self, "path", _optional_path("data.path", self.path))
+        object.__setattr__(
+            self,
+            "mmap_path",
+            _optional_path("data.mmap_path", self.mmap_path),
+        )
+        object.__setattr__(
+            self,
+            "text_path",
+            _optional_path("data.text_path", self.text_path),
+        )
+        if not isinstance(self.text_key, str):
+            raise TypeError("data.text_key must be a string")
+        if not self.text_key.strip():
+            raise ValueError("data.text_key must not be empty")
+        if self.tokenizer is not None and not isinstance(self.tokenizer, TokenizerConfig):
+            raise TypeError("data.tokenizer must be a TokenizerConfig or null")
         _require_int("data.num_workers", self.num_workers, minimum=0)
-        if self.tokenizer is not None and not isinstance(self.tokenizer, str):
-            raise TypeError("data.tokenizer must be a string or null")
         _require_bool("data.shuffle", self.shuffle)
         _require_bool("data.packed_sequences", self.packed_sequences)
 

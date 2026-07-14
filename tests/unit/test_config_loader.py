@@ -39,6 +39,14 @@ def test_config_from_dict_is_recursive_strict_and_typed() -> None:
             "context_parallel": {"backend": "ring", "dropout": 0.0},
             "optimizer": {"betas": [0.8, 0.9]},
             "checkpoint": {"directory": "tmp/checkpoints"},
+            "data": {
+                "text_path": "data/train.jsonl",
+                "text_key": "story",
+                "tokenizer": {
+                    "path": "artifacts/tokenizer",
+                    "append_eos": False,
+                },
+            },
         }
     )
 
@@ -49,6 +57,11 @@ def test_config_from_dict_is_recursive_strict_and_typed() -> None:
     assert config.context_parallel.backend.value == "ring"
     assert config.optimizer.betas == (0.8, 0.9)
     assert config.checkpoint.directory == Path("tmp/checkpoints")
+    assert config.data.text_path == Path("data/train.jsonl")
+    assert config.data.text_key == "story"
+    assert config.data.tokenizer is not None
+    assert config.data.tokenizer.path == Path("artifacts/tokenizer")
+    assert not config.data.tokenizer.append_eos
 
 
 @pytest.mark.parametrize(
@@ -57,6 +70,7 @@ def test_config_from_dict_is_recursive_strict_and_typed() -> None:
         {"quantization": {"int8": True}},
         {"model": {"fp8": True}},
         {"parallel": {"tensor": 1, "mystery_axis": 2}},
+        {"data": {"tokenizer": {"path": "tokenizer", "backend": "bpe"}}},
     ],
 )
 def test_unknown_or_quantization_fields_are_rejected(payload: dict[str, object]) -> None:

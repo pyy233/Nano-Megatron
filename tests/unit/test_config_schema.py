@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import itertools
+from pathlib import Path
 
 import pytest
 
@@ -9,6 +10,7 @@ from nano_megatron.config import (
     CheckpointConfig,
     ContextParallelBackend,
     ContextParallelConfig,
+    DataConfig,
     DataParallelConfig,
     DataParallelMode,
     GPTConfig,
@@ -16,6 +18,7 @@ from nano_megatron.config import (
     ParallelConfig,
     PipelineConfig,
     PrecisionConfig,
+    TokenizerConfig,
     TrainConfig,
     TrainingConfig,
     validate_config,
@@ -86,6 +89,32 @@ def test_context_parallel_config_is_separate_from_topology_and_dropout_is_explic
 
     with pytest.raises(ValueError, match="dropout must be 0"):
         ContextParallelConfig(dropout=0.1)
+
+
+def test_tokenizer_and_text_data_config_are_typed_and_normalize_paths() -> None:
+    tokenizer = TokenizerConfig(path="artifacts/tokenizer", append_eos=False)
+    data = DataConfig(
+        text_path="data/train.jsonl",
+        text_key="story",
+        tokenizer=tokenizer,
+    )
+
+    assert tokenizer.path == Path("artifacts/tokenizer")
+    assert not tokenizer.append_eos
+    assert data.text_path == Path("data/train.jsonl")
+    assert data.text_key == "story"
+    assert data.tokenizer is tokenizer
+
+
+def test_tokenizer_and_text_data_config_reject_invalid_local_values() -> None:
+    with pytest.raises(TypeError, match="tokenizer.path"):
+        TokenizerConfig(path=object())  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="tokenizer.path"):
+        TokenizerConfig(path="")
+    with pytest.raises(TypeError, match="append_eos"):
+        TokenizerConfig(path="tokenizer", append_eos=1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="text_key"):
+        DataConfig(text_key="   ")
 
 
 def test_gpt_config_exposes_readable_aliases_and_vocab_padding() -> None:
@@ -199,6 +228,36 @@ def test_validation_rejects_cross_block_invariants() -> None:
     assert "model.heads" in message
     assert "model.kv_heads" in message
     assert "model.layers" in message
+
+
+@pytest.mark.parametrize(
+    ("data", "message"),
+    [
+        (
+            DataConfig(
+                path="tokens.pt",
+                text_path="stories.jsonl",
+                tokenizer=TokenizerConfig(path="tokenizer"),
+            ),
+            "data.path, data.mmap_path, and data.text_path are mutually exclusive",
+        ),
+        (DataConfig(text_path="stories.jsonl"), "data.text_path requires data.tokenizer"),
+        (
+            DataConfig(tokenizer=TokenizerConfig(path="tokenizer")),
+            "data.tokenizer requires data.path, data.mmap_path, or data.text_path",
+        ),
+        (
+            DataConfig(packed_sequences=True),
+            "document-aware attention masks are not implemented",
+        ),
+    ],
+)
+def test_validation_rejects_unsupported_data_source_combinations(
+    data: DataConfig,
+    message: str,
+) -> None:
+    with pytest.raises(ConfigValidationError, match=message):
+        validate_config(small_config(data=data), world_size=1)
 
 
 def test_validation_rejects_offload_modes_that_do_not_own_the_lifecycle() -> None:

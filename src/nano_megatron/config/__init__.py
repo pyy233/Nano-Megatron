@@ -27,6 +27,7 @@ from .schema import (
     PipelineSchedule,
     PrecisionConfig,
     PrecisionDType,
+    TokenizerConfig,
     TrainConfig,
     TrainingConfig,
 )
@@ -60,6 +61,7 @@ __all__ = [
     "PipelineSchedule",
     "PrecisionConfig",
     "PrecisionDType",
+    "TokenizerConfig",
     "TrainConfig",
     "TrainingConfig",
     "ValidationResult",

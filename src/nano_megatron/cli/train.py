@@ -18,6 +18,7 @@ from nano_megatron.distributed import DistributedRuntime
 from nano_megatron.models.gpt import DenseGPTComponents, GPTModelBuilder
 from nano_megatron.nn.kernels import build_kernel_backend
 from nano_megatron.parallel import ParallelContext, ParallelRNG, ParameterDomainRegistry, RNGStream
+from nano_megatron.tokenizer import ByteLevelBPETokenizer, validate_tokenizer_for_model
 from nano_megatron.training import Trainer
 
 
@@ -50,6 +51,10 @@ def run(config_path: Path, *, overrides: Sequence[str], resume: Path | None, max
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     config = load_config(config_path, overrides=overrides, world_size=world_size)
     validate_config(config, world_size=world_size)
+    tokenizer = None
+    if config.data.tokenizer is not None:
+        tokenizer = ByteLevelBPETokenizer.load(config.data.tokenizer.path)
+        validate_tokenizer_for_model(tokenizer, config.model)
 
     with (
         DistributedRuntime(config.distributed) as runtime,
@@ -89,19 +94,39 @@ def run(config_path: Path, *, overrides: Sequence[str], resume: Path | None, max
             parallel=parallel,
             run_config=config,
         )
-        data = build_train_dataloader(config, parallel)
         trainer = Trainer(
             config=config,
             model=model,
             parallel=parallel,
             data_parallel=strategy,
             checkpoint=checkpoint,
-            data_iterator=iter(data),
+            data_iterator=None,
             rng=rng,
         )
         try:
             if resume is not None:
                 trainer.load_checkpoint(resume)
+            data = build_train_dataloader(
+                config,
+                parallel,
+                tokenizer=tokenizer,
+                max_steps=max_steps,
+                start_step=trainer.state.step,
+                consumed_samples=trainer.state.consumed_samples,
+            )
+            data_fingerprint = (
+                getattr(data, "data_fingerprint", None) if trainer.batch_router.is_source else None
+            )
+            if trainer.batch_router.is_source and not isinstance(data_fingerprint, str):
+                raise TypeError("source DataLoader must expose data_fingerprint")
+            if trainer.batch_router.is_source:
+                trainer.bind_data_iterator(
+                    data,
+                    data_fingerprint=data_fingerprint,
+                )
+            else:
+                trainer.data_iterator = iter(data)
+            if resume is not None:
                 trainer.restore_data_position()
             state = trainer.fit(max_steps=max_steps)
         finally:
