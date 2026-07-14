@@ -48,6 +48,29 @@ class _FakeRNG:
         self.value = int(state["value"])
 
 
+def test_dcp_compatibility_drops_unsupported_no_dist_keyword() -> None:
+    captured = {}
+
+    def legacy_save(state, *, checkpoint_id, process_group):
+        captured.update(
+            state=state,
+            checkpoint_id=checkpoint_id,
+            process_group=process_group,
+        )
+        return "saved"
+
+    result = checkpoint_manager_module._call_dcp(
+        legacy_save,
+        {"model": object()},
+        checkpoint_id=Path("checkpoint"),
+        process_group=object(),
+        no_dist=False,
+    )
+
+    assert result == "saved"
+    assert set(captured) == {"state", "checkpoint_id", "process_group"}
+
+
 def _setup(
     tmp_path: Path,
     *,

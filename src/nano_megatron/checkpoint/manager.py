@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass
+from inspect import Parameter, signature
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,19 @@ from .manifest import (
 from .mapping import ShardedState
 
 TrainerState = dict[str, Any]
+
+
+def _call_dcp(function: Any, *args: Any, **kwargs: Any) -> Any:
+    """Call a DCP entry point while tolerating older optional parameters."""
+
+    try:
+        parameters = signature(function).parameters.values()
+    except (TypeError, ValueError):
+        parameters = ()
+    accepts_kwargs = any(parameter.kind is Parameter.VAR_KEYWORD for parameter in parameters)
+    if not accepts_kwargs and "no_dist" not in {parameter.name for parameter in parameters}:
+        kwargs.pop("no_dist", None)
+    return function(*args, **kwargs)
 
 
 @dataclass(frozen=True)
@@ -568,7 +582,8 @@ class CheckpointManager:
             import torch.distributed.checkpoint as dcp
         except ImportError as error:
             raise RuntimeError("async checkpointing requires PyTorch DCP") from error
-        return dcp.async_save(
+        return _call_dcp(
+            dcp.async_save,
             state,
             checkpoint_id=checkpoint_id,
             process_group=process_group,
@@ -613,7 +628,8 @@ class CheckpointManager:
         if not callable(state_dict):
             raise RuntimeError("ZeRO-3 strategy does not expose a DCP state dict")
         group = self._zero3_state_group(data_parallel)
-        dcp.save(
+        _call_dcp(
+            dcp.save,
             state_dict(),
             checkpoint_id=self._zero3_state_path(target, data_parallel),
             process_group=group.process_group,
@@ -639,7 +655,8 @@ class CheckpointManager:
             raise RuntimeError("ZeRO-3 strategy does not expose DCP checkpoint methods")
         group = self._zero3_state_group(data_parallel)
         state = state_dict()
-        dcp.load(
+        _call_dcp(
+            dcp.load,
             state,
             checkpoint_id=self._zero3_state_path(path, data_parallel),
             process_group=group.process_group,

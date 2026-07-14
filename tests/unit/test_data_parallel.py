@@ -234,10 +234,20 @@ def test_zero3_rejects_offload_when_the_replica_mesh_has_size_one() -> None:
         runtime.close()
 
 
+def _fsdp2_module():
+    import torch.distributed.fsdp as fsdp
+
+    if hasattr(fsdp, "fully_shard"):
+        return fsdp
+    from torch.distributed._composable import fsdp as composable_fsdp
+
+    return composable_fsdp
+
+
 def test_zero3_forwards_fsdp2_reshard_precision_and_pin_memory_options(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import torch.distributed.fsdp as fsdp
+    fsdp = _fsdp2_module()
 
     captured: dict[str, object] = {}
     sharded_modules: list[nn.Module] = []
@@ -301,7 +311,8 @@ def test_zero3_fully_shards_virtual_chunks_and_keeps_outer_checkpoint_root(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import torch.distributed.checkpoint.state_dict as dcp_state_dict
-    import torch.distributed.fsdp as fsdp
+
+    fsdp = _fsdp2_module()
 
     sharded_modules: list[nn.Module] = []
 

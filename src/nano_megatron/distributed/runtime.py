@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 from collections.abc import Iterable
 from datetime import timedelta
+from inspect import Parameter, signature
 from types import ModuleType
 from typing import Any
 
@@ -239,11 +240,27 @@ class DistributedRuntime:
                 "a default torch.distributed process group is required to create subgroups"
             )
         assert self._dist is not None
-        return self._dist.new_group(
-            ranks=list(concrete_ranks),
-            backend=backend or self.backend,
-            timeout=timedelta(minutes=self.config.timeout_minutes),
-        )
+        selected_backend = backend or self.backend
+        kwargs: dict[str, Any] = {
+            "ranks": list(concrete_ranks),
+            "backend": selected_backend,
+            "timeout": timedelta(minutes=self.config.timeout_minutes),
+        }
+        if self.device_type == "cuda" and "nccl" in selected_backend.lower():
+            # PyTorch 2.6+ eagerly forms the NCCL communicator when device_id
+            # is supplied.  Without it, overlapping TP/PP groups are created
+            # lazily on their first collective and can be initialized in a
+            # different order on different pipeline stages.
+            try:
+                parameters = signature(self._dist.new_group).parameters.values()
+            except (TypeError, ValueError):
+                parameters = ()
+            if any(
+                parameter.name == "device_id" or parameter.kind is Parameter.VAR_KEYWORD
+                for parameter in parameters
+            ):
+                kwargs["device_id"] = self.device
+        return self._dist.new_group(**kwargs)
 
     def is_group_member(self, process_group: Any | None) -> bool:
         if process_group is None:

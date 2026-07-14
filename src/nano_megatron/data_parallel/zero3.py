@@ -99,10 +99,19 @@ class Zero3Strategy(DataParallelStrategy):
                 MixedPrecisionPolicy,
                 fully_shard,
             )
-        except (ImportError, AttributeError) as error:
-            raise RuntimeError(
-                "ZeRO-3 requires the FSDP2 fully_shard API from PyTorch 2.6 or newer"
-            ) from error
+        except (ImportError, AttributeError):
+            # Torch 2.4/2.5 expose the same composable FSDP2 API from its
+            # implementation namespace; 2.6 re-exports it from fsdp.
+            try:
+                from torch.distributed._composable.fsdp import (
+                    CPUOffloadPolicy,
+                    MixedPrecisionPolicy,
+                    fully_shard,
+                )
+            except (ImportError, AttributeError) as error:
+                raise RuntimeError(
+                    "ZeRO-3 requires the FSDP2 fully_shard API from PyTorch 2.4 or newer"
+                ) from error
 
         domain = next(iter(domains), ParameterDomain.DENSE)
         group_key = (

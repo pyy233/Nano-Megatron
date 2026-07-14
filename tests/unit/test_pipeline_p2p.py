@@ -180,6 +180,44 @@ def test_pipeline_cycle_source_coloring_is_proper_for_even_and_odd_sizes() -> No
         assert max(colors) == (1 if size % 2 == 0 else 2)
 
 
+def test_nccl_warmup_initializes_model_groups_before_transports(monkeypatch) -> None:
+    parallel, transport_groups = _source_colored_parallel(backend="nccl")
+    tp_group = object()
+    parallel.tp = SimpleNamespace(
+        rank=0,
+        size=2,
+        ranks=(0, 1),
+        process_group=tp_group,
+        backend="nccl",
+    )
+    dense_replica_group = object()
+    parallel.dense_replica = SimpleNamespace(
+        rank=0,
+        size=2,
+        ranks=(0, 1),
+        process_group=dense_replica_group,
+        backend="nccl",
+    )
+    calls = []
+    monkeypatch.setattr(dist, "all_reduce", lambda tensor, *, group: calls.append(group))
+    communicator = P2PCommunicator(
+        parallel,
+        activation_shape=(2, 3),
+        activation_dtype=torch.float32,
+        device="cpu",
+    )
+
+    communicator._ensure_transport_ready()
+    communicator._ensure_transport_ready()
+
+    assert calls == [
+        tp_group,
+        dense_replica_group,
+        transport_groups[0],
+        transport_groups[1],
+    ]
+
+
 def test_multi_rank_nccl_requires_source_colored_transport_groups() -> None:
     raw_group = object()
     parallel = SimpleNamespace(

@@ -361,12 +361,15 @@ class P2PCommunicator:
         )
 
     def _ensure_transport_ready(self) -> None:
-        """Eagerly initialize every NCCL channel in one deterministic order.
+        """Eagerly initialize model and P2P NCCL channels in one order.
 
         NCCL documents that the first batched P2P use of a communicator must
         involve all its ranks.  A tiny all-reduce satisfies that requirement
         before source-colored ranks begin using different transport channels.
-        Gloo and test doubles do not need this collective warmup.
+        TP/CP/EP and parameter-replica groups are initialized first because
+        otherwise one pipeline stage may enter its first model/FSDP collective
+        while the next stage posts a P2P receive on another lazy NCCL
+        communicator.  Gloo and test doubles do not need this warmup.
         """
 
         if self._transport_ready:
@@ -381,7 +384,15 @@ class P2PCommunicator:
         color_count = 2 if int(self.group.size) % 2 == 0 else 3
         seen: set[int] = set()
         token = torch.zeros((), dtype=torch.int32, device=self.device)
-        for group in self._transport_groups[:color_count]:
+        model_groups = []
+        for name in ("tp", "cp", "ep", "dense_replica", "expert_replica"):
+            group = getattr(self.parallel, name, None)
+            if group is None:
+                continue
+            group = require_parallel_group(group, name=f"{name}-parallel group")
+            if int(group.size) > 1 and "nccl" in str(group.backend).lower():
+                model_groups.append(group)
+        for group in (*model_groups, *self._transport_groups[:color_count]):
             raw_group = _raw_group(group)
             identity = id(raw_group)
             if identity in seen:
