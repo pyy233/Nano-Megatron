@@ -18,7 +18,7 @@ model:
   heads: 4
   kv_heads: 4
   seq_length: 128
-  vocab_size: 4096
+  vocab_size: 8192
   dropout: 0.0
   tie_embeddings: true
 
@@ -60,6 +60,12 @@ optimizer:
   weight_decay: 0.1
   clip_grad_norm: 1.0
 
+lr_scheduler:
+  schedule: cosine
+  warmup_steps: 2
+  decay_steps: null
+  min_lr: 0.00003
+
 training:
   micro_batch_size: 2
   gradient_accumulation_steps: 2
@@ -68,19 +74,39 @@ training:
   log_interval: 1
 
 checkpoint:
-  directory: checkpoints/gpt_tinystories_cpu
+  directory: checkpoints/gpt_tinystories_cpu_8k_500k
   save_interval: 10
   async_save: false
   keep_last: 2
 
 data:
-  path: data/processed/tinystories-4k.pt
+  path: data/processed/tinystories-8k-500k-train.pt
   mmap_path: null
   text_path: null
   text_key: text
   tokenizer:
-    path: data/tokenizers/tinystories-4k
+    path: data/tokenizers/tinystories-8k-500k
     append_eos: true
   num_workers: 0
   shuffle: true
   packed_sequences: false
+
+validation:
+  interval: 5
+  batches: 10
+  data:
+    path: data/processed/tinystories-8k-500k-validation.pt
+    mmap_path: null
+    text_path: null
+    text_key: text
+    tokenizer:
+      path: data/tokenizers/tinystories-8k-500k
+      append_eos: true
+    num_workers: 0
+    shuffle: false
+    packed_sequences: false
+
+wandb:
+  enabled: false
+  project: nano-megatron-tinystories
+  mode: offline

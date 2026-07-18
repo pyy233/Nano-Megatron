@@ -410,7 +410,7 @@ class PipelineScheduleExecutor:
             output = local_stage(hidden, batch)
 
         if following is None:
-            output, local_metrics = extract_loss(output, divisor)
+            output, local_metrics = extract_loss(output, divisor, batch)
             losses.append(output)
             accumulate_metrics(metric_sums, metric_counts, local_metrics)
         elif not isinstance(output, Tensor):

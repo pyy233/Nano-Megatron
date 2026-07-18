@@ -127,3 +127,4 @@ def test_single_process_training_step_updates_parameters(
         assert state.step == 1
         assert state.consumed_samples == 4
         assert not torch.equal(before, after)
+        assert (tmp_path / "step_00000001" / ".complete").is_file()

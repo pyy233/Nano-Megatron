@@ -13,6 +13,7 @@ from nano_megatron.data import (
     FixedLengthTokenDataset,
     MMapTokenCorpus,
     MMapTokenDataset,
+    StatefulDataLoader,
     TokenCorpus,
     build_train_dataloader,
     build_train_dataset,
@@ -214,8 +215,8 @@ def test_tensor_and_mmap_loaders_have_identical_data_fingerprints(tmp_path: Path
         tokenizer,
     )
 
-    assert isinstance(tensor_loader, DataLoader)
-    assert isinstance(mmap_loader, DataLoader)
+    assert isinstance(tensor_loader, StatefulDataLoader)
+    assert isinstance(mmap_loader, StatefulDataLoader)
     assert isinstance(mmap_loader.dataset, MMapTokenDataset)
     assert tensor_loader.data_fingerprint == mmap_loader.data_fingerprint
 

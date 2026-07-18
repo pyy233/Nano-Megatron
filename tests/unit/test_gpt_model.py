@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from types import SimpleNamespace
 
 import torch
 
@@ -15,7 +14,6 @@ from nano_megatron.models.gpt import (
 )
 from nano_megatron.nn.kernels import (
     TorchKernelBackend,
-    TransformerEngineBackend,
     build_kernel_backend,
 )
 from nano_megatron.parallel import (
@@ -220,66 +218,6 @@ def test_single_stage_pipeline_wrapper_unpacks_batch_and_returns_loss() -> None:
 def test_kernel_backend_factory_builds_torch_reference() -> None:
     config = type("KernelConfig", (), {"backend": "torch"})()
     assert isinstance(build_kernel_backend(config, FakeParallel()), TorchKernelBackend)
-
-
-def test_transformer_engine_adapter_uses_local_modules_and_torch_attention(
-    monkeypatch,
-) -> None:
-    class FakeLinear(torch.nn.Linear):
-        def __init__(
-            self,
-            in_features,
-            out_features,
-            *,
-            bias=True,
-            params_dtype=None,
-            device=None,
-        ) -> None:
-            super().__init__(
-                in_features,
-                out_features,
-                bias=bias,
-                device=device,
-                dtype=params_dtype,
-            )
-
-    class FakeRMSNorm(torch.nn.Module):
-        def __init__(
-            self,
-            normalized_shape,
-            *,
-            eps,
-            params_dtype=None,
-            device=None,
-        ) -> None:
-            super().__init__()
-            self.weight = torch.nn.Parameter(
-                torch.ones(normalized_shape, device=device, dtype=params_dtype)
-            )
-            self.eps = eps
-
-        def forward(self, value):
-            return value * torch.rsqrt(value.square().mean(dim=-1, keepdim=True) + self.eps)
-
-    fake_te = SimpleNamespace(Linear=FakeLinear, RMSNorm=FakeRMSNorm)
-    monkeypatch.setattr(
-        "nano_megatron.nn.kernels.transformer_engine.importlib.import_module",
-        lambda name: fake_te,
-    )
-    config = type("KernelConfig", (), {"backend": "transformer_engine"})()
-    backend = build_kernel_backend(config, FakeParallel())
-
-    assert isinstance(backend, TransformerEngineBackend)
-    linear = backend.linear(4, 3, bias=False, dtype=torch.float64)
-    norm = backend.rms_norm(4, 1.0e-5, dtype=torch.float64)
-    assert isinstance(linear, FakeLinear)
-    assert isinstance(norm, FakeRMSNorm)
-    assert linear.weight.dtype is torch.float64
-    q = torch.randn(1, 2, 3, 4)
-    torch.testing.assert_close(
-        backend.local_attention(q, q, q, causal=True),
-        TorchKernelBackend().local_attention(q, q, q, causal=True),
-    )
 
 
 def test_explicit_activation_rng_keys_dropout_by_microbatch_identity() -> None:

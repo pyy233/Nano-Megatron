@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import json
+import math
 import shutil
 import warnings
 from collections.abc import Mapping
@@ -29,6 +31,10 @@ from .mapping import ShardedState
 
 TrainerState = dict[str, Any]
 
+_DCP_SUBGROUP_COORDINATOR_PATCHED = False
+_BEST_VALIDATION_FILE = "best_validation.json"
+_BEST_VALIDATION_VERSION = 1
+
 
 def _call_dcp(function: Any, *args: Any, **kwargs: Any) -> Any:
     """Call a DCP entry point while tolerating older optional parameters."""
@@ -41,6 +47,52 @@ def _call_dcp(function: Any, *args: Any, **kwargs: Any) -> Any:
     if not accepts_kwargs and "no_dist" not in {parameter.name for parameter in parameters}:
         kwargs.pop("no_dist", None)
     return function(*args, **kwargs)
+
+
+def _ensure_dcp_subgroup_coordinator_compatibility() -> None:
+    """Backport PyTorch's subgroup coordinator fix for older DCP releases.
+
+    PyTorch 2.6's DCP wrapper treats ``coordinator_rank`` as a process-group
+    rank when choosing the coordinator, but passes it to object collectives as
+    a global rank.  A subgroup that does not contain global rank zero therefore
+    fails during save/load.  Newer PyTorch keeps both representations.  Patch
+    only the older Python implementation and leave fixed releases untouched.
+    """
+
+    global _DCP_SUBGROUP_COORDINATOR_PATCHED
+    if _DCP_SUBGROUP_COORDINATOR_PATCHED:
+        return
+
+    import torch.distributed as dist
+    from torch.distributed.checkpoint import state_dict_loader, state_dict_saver, utils
+
+    wrapper = utils._DistWrapper
+    initializer = getattr(wrapper, "__init__", None)
+    code = getattr(initializer, "__code__", None)
+    if code is None or "global_coordinator_rank" in code.co_names:
+        _DCP_SUBGROUP_COORDINATOR_PATCHED = True
+        return
+
+    class _SubgroupSafeDistWrapper(wrapper):
+        def __init__(
+            self,
+            group: Any | None,
+            use_dist: bool,
+            coordinator_rank: int,
+        ) -> None:
+            # The legacy initializer must see the group-local rank so its
+            # ``is_coordinator`` calculation remains correct.
+            super().__init__(group, use_dist, coordinator_rank)
+            if use_dist and group is not None:
+                # Legacy object collectives read ``coordinator_rank`` directly
+                # as a global rank.  Convert it only after ``is_coordinator``
+                # has been computed.
+                self.coordinator_rank = dist.get_global_rank(group, coordinator_rank)
+
+    utils._DistWrapper = _SubgroupSafeDistWrapper
+    state_dict_saver._DistWrapper = _SubgroupSafeDistWrapper
+    state_dict_loader._DistWrapper = _SubgroupSafeDistWrapper
+    _DCP_SUBGROUP_COORDINATOR_PATCHED = True
 
 
 @dataclass(frozen=True)
@@ -411,6 +463,88 @@ class CheckpointManager:
         )
         return complete[-1] if complete else None
 
+    def best_validation(self) -> dict[str, Any] | None:
+        """Return the validated best-validation pin for this run, if present."""
+
+        path = self.directory / _BEST_VALIDATION_FILE
+        if not path.exists():
+            return None
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError(f"could not read best-validation checkpoint pin: {error}") from error
+        if not isinstance(value, dict) or set(value) != {
+            "checkpoint",
+            "format_version",
+            "metric",
+            "mode",
+            "step",
+            "value",
+        }:
+            raise ValueError("best-validation checkpoint pin has invalid fields")
+        step = value.get("step")
+        loss = value.get("value")
+        checkpoint_name = value.get("checkpoint")
+        if value.get("format_version") != _BEST_VALIDATION_VERSION:
+            raise ValueError("best-validation checkpoint pin has unsupported format_version")
+        if value.get("metric") != "loss" or value.get("mode") != "min":
+            raise ValueError("best-validation checkpoint pin metric contract is invalid")
+        if isinstance(step, bool) or not isinstance(step, int) or step < 0:
+            raise ValueError("best-validation checkpoint pin step is invalid")
+        if (
+            isinstance(loss, bool)
+            or not isinstance(loss, (int, float))
+            or not math.isfinite(float(loss))
+            or float(loss) < 0.0
+        ):
+            raise ValueError("best-validation checkpoint pin value is invalid")
+        expected_name = f"step_{step:08d}"
+        if checkpoint_name != expected_name:
+            raise ValueError("best-validation checkpoint pin path does not match its step")
+        checkpoint = self.directory / expected_name
+        if not checkpoint.is_dir() or not (checkpoint / ".complete").is_file():
+            raise ValueError("best-validation checkpoint pin points to an incomplete checkpoint")
+        return dict(value)
+
+    def pin_best_validation(self, step: int, loss: float) -> Path:
+        """Atomically pin one complete checkpoint so retention cannot remove it."""
+
+        if isinstance(step, bool) or not isinstance(step, int) or step < 0:
+            raise ValueError("best-validation step must be a non-negative integer")
+        if (
+            isinstance(loss, bool)
+            or not isinstance(loss, (int, float))
+            or not math.isfinite(float(loss))
+            or float(loss) < 0.0
+        ):
+            raise ValueError("best-validation loss must be finite and non-negative")
+        self.flush()
+        target = self.directory / f"step_{step:08d}"
+        local_error: BaseException | None = None
+        if self._is_coordinator():
+            try:
+                if not target.is_dir() or not (target / ".complete").is_file():
+                    raise ValueError(
+                        f"cannot pin incomplete best-validation checkpoint: {target}"
+                    )
+                payload = {
+                    "checkpoint": target.name,
+                    "format_version": _BEST_VALIDATION_VERSION,
+                    "metric": "loss",
+                    "mode": "min",
+                    "step": step,
+                    "value": float(loss),
+                }
+                _atomic_json_write(self.directory / _BEST_VALIDATION_FILE, payload)
+                self._remove_old_checkpoints(exclude=target)
+            except BaseException as error:
+                local_error = error
+        self._collective_error(
+            local_error,
+            message=f"best-validation checkpoint pin failed for {target}",
+        )
+        return target
+
     def _finish_pending(self, pending: _PendingCheckpoint) -> None:
         local_error: BaseException | None = None
         for handle in pending.handles:
@@ -582,6 +716,7 @@ class CheckpointManager:
             import torch.distributed.checkpoint as dcp
         except ImportError as error:
             raise RuntimeError("async checkpointing requires PyTorch DCP") from error
+        _ensure_dcp_subgroup_coordinator_compatibility()
         return _call_dcp(
             dcp.async_save,
             state,
@@ -624,6 +759,7 @@ class CheckpointManager:
             import torch.distributed.checkpoint as dcp
         except ImportError as error:
             raise RuntimeError("ZeRO-3 checkpointing requires PyTorch DCP") from error
+        _ensure_dcp_subgroup_coordinator_compatibility()
         state_dict = getattr(data_parallel, "distributed_checkpoint_state_dict", None)
         if not callable(state_dict):
             raise RuntimeError("ZeRO-3 strategy does not expose a DCP state dict")
@@ -645,6 +781,7 @@ class CheckpointManager:
             import torch.distributed.checkpoint as dcp
         except ImportError as error:
             raise RuntimeError("ZeRO-3 checkpointing requires PyTorch DCP") from error
+        _ensure_dcp_subgroup_coordinator_compatibility()
         state_dict = getattr(data_parallel, "distributed_checkpoint_state_dict", None)
         load_state_dict = getattr(
             data_parallel,
@@ -950,10 +1087,15 @@ class CheckpointManager:
     def _remove_old_checkpoints(self, *, exclude: Path) -> None:
         if self.keep_last == 0:
             return
+        best = self.best_validation()
+        protected = None if best is None else self.directory / str(best["checkpoint"])
         checkpoints = sorted(
             path
             for path in self.directory.glob("step_*")
-            if path.is_dir() and (path / ".complete").is_file() and path != exclude
+            if path.is_dir()
+            and (path / ".complete").is_file()
+            and path != exclude
+            and path != protected
         )
         total_to_remove = max(0, len(checkpoints) + 1 - self.keep_last)
         for path in checkpoints[:total_to_remove]:
@@ -1038,6 +1180,18 @@ def _atomic_text_write(path: Path, value: str) -> None:
     temporary = path.with_name(f".{path.name}.tmp")
     try:
         temporary.write_text(value)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _atomic_json_write(path: Path, value: Mapping[str, Any]) -> None:
+    temporary = path.with_name(f".{path.name}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(dict(value), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)

@@ -14,6 +14,7 @@ from nano_megatron.config import (
     DataParallelConfig,
     DataParallelMode,
     GPTConfig,
+    LearningRateSchedulerConfig,
     OffloadConfig,
     ParallelConfig,
     PipelineConfig,
@@ -21,6 +22,8 @@ from nano_megatron.config import (
     TokenizerConfig,
     TrainConfig,
     TrainingConfig,
+    ValidationConfig,
+    WandbConfig,
     validate_config,
 )
 from nano_megatron.config.validation import ConfigValidationError
@@ -147,6 +150,57 @@ def test_validation_derives_replica_batch_and_padded_vocab() -> None:
     assert result.global_batch_size == 3 * 4 * 2 * 2
     assert result.padded_vocab_size == 18
     assert any("EP>1" in warning for warning in result.warnings)
+
+
+def test_scheduler_validation_rejects_incompatible_horizons_and_floor() -> None:
+    with pytest.raises(ConfigValidationError, match="warmup_steps"):
+        validate_config(
+            small_config(
+                training=TrainingConfig(max_steps=10),
+                lr_scheduler=LearningRateSchedulerConfig(warmup_steps=11),
+            ),
+            world_size=1,
+        )
+    with pytest.raises(ConfigValidationError, match="min_lr"):
+        validate_config(
+            small_config(
+                lr_scheduler=LearningRateSchedulerConfig(min_lr=1.0),
+            ),
+            world_size=1,
+        )
+
+
+def test_enabled_validation_requires_an_explicit_data_source() -> None:
+    with pytest.raises(ConfigValidationError, match="requires validation.data"):
+        validate_config(
+            small_config(validation=ValidationConfig(interval=1)),
+            world_size=1,
+        )
+    with pytest.raises(ConfigValidationError, match="must configure path"):
+        validate_config(
+            small_config(
+                validation=ValidationConfig(interval=1, data=DataConfig()),
+            ),
+            world_size=1,
+        )
+
+
+def test_wandb_config_is_typed_and_validates_local_values() -> None:
+    config = WandbConfig(
+        enabled=True,
+        project=" tests ",
+        tags=("cpu", "tiny"),
+        mode="OFFLINE",
+        directory="artifacts/wandb",
+    )
+
+    assert config.project == "tests"
+    assert config.mode == "offline"
+    assert config.directory == Path("artifacts/wandb")
+    with pytest.raises(ValueError, match="wandb.mode"):
+        WandbConfig(mode="remote")
+    with pytest.raises(TypeError, match="sequence of strings"):
+        WandbConfig(tags="cpu")  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
@@ -370,6 +424,16 @@ def test_validation_rejects_invalid_virtual_pipeline_contracts(
 
 def test_checkpoint_save_interval_zero_disables_periodic_saves() -> None:
     assert CheckpointConfig(save_interval=0).save_interval == 0
+
+
+def test_checkpoint_final_and_best_validation_defaults_are_enabled() -> None:
+    checkpoint = CheckpointConfig()
+
+    assert checkpoint.save_final
+    assert checkpoint.save_best_validation
+
+    with pytest.raises(TypeError, match="checkpoint.save_final"):
+        CheckpointConfig(save_final=1)  # type: ignore[arg-type]
 
 
 def test_validation_rejects_checkpoint_offload_when_checkpointing_is_disabled() -> None:

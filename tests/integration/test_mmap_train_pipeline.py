@@ -119,7 +119,7 @@ def test_mmap_reaches_gpt_step_and_resumes_checkpoint_created_from_pt(
     assert mmap_corpus.token_count == pt_corpus.tokens.numel()
     mmap_corpus.close()
     first = run(pt_config, overrides=(), resume=None, max_steps=1)
-    checkpoint = checkpoints / "step_00000001"
+    checkpoint = next(checkpoints.glob("*/step_00000001"))
     resumed = run(mmap_config, overrides=(), resume=checkpoint, max_steps=2)
 
     assert checkpoint.is_dir()

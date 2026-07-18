@@ -122,6 +122,24 @@ class DDPStrategy(DataParallelStrategy):
         self.finalize_gradients()
         self.optimizer.step()
 
+    def set_learning_rate(self, learning_rate: float) -> None:
+        if self.optimizer is None:
+            raise RuntimeError("DDPStrategy.setup() must be called before setting LR")
+        value = float(learning_rate)
+        if value < 0.0:
+            raise ValueError("learning rate must be non-negative")
+        for group in self.optimizer.param_groups:
+            group["lr"] = value
+
+    @property
+    def learning_rate(self) -> float:
+        if self.optimizer is None:
+            raise RuntimeError("DDPStrategy.setup() must be called before reading LR")
+        rates = {float(group["lr"]) for group in self.optimizer.param_groups}
+        if len(rates) != 1:
+            raise RuntimeError("Nano-Megatron requires one learning rate across param groups")
+        return next(iter(rates))
+
     def zero_grad(self) -> None:
         if self.optimizer is None:
             raise RuntimeError("DDPStrategy.setup() must be called before zero_grad()")

@@ -10,7 +10,20 @@ wheels/
 .venv
 .pytest_cache/
 .ruff_cache/
+
+# Local training and release artifacts
 checkpoints/
 /data/
+exported/
+hf_release/
+logs/
 *.pt
 *.pth
+wandb/
+
+# Local agent planning state
+.planning/
+.plan-attestation
+task_plan.md
+progress.md
+findings.md

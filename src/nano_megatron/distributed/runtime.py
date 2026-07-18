@@ -10,7 +10,6 @@ from __future__ import annotations
 import os
 from collections.abc import Iterable
 from datetime import timedelta
-from inspect import Parameter, signature
 from types import ModuleType
 from typing import Any
 
@@ -124,11 +123,10 @@ class DistributedRuntime:
                 "rank": rank,
                 "world_size": world_size,
             }
-            if device_type == "cuda" and "nccl" in backend.lower():
-                # Bind collective barriers and object-collective staging to the
-                # same explicit local CUDA device instead of asking NCCL to
-                # guess from the global rank.
-                kwargs["device_id"] = device
+            # ``torch.cuda.set_device(local_rank)`` above is the authoritative
+            # binding. Do not also pass WORLD device_id: Torch 2.6 implements
+            # that eager path with NCCL communicator splitting, which can
+            # corrupt later subgroups on real 8-GPU topologies.
             try:
                 dist.init_process_group(**kwargs)
             except Exception as error:
@@ -209,7 +207,10 @@ class DistributedRuntime:
         if self.world_size == 1:
             return
         assert self._dist is not None
-        self._dist.barrier()
+        kwargs = {}
+        if self.device_type == "cuda" and "nccl" in self.backend.lower():
+            kwargs["device_ids"] = [self.local_rank]
+        self._dist.barrier(**kwargs)
 
     def all_gather_object(self, value: Any) -> list[Any]:
         """Gather one Python value across the explicitly owned WORLD group."""
@@ -246,20 +247,13 @@ class DistributedRuntime:
             "backend": selected_backend,
             "timeout": timedelta(minutes=self.config.timeout_minutes),
         }
-        if self.device_type == "cuda" and "nccl" in selected_backend.lower():
-            # PyTorch 2.6+ eagerly forms the NCCL communicator when device_id
-            # is supplied.  Without it, overlapping TP/PP groups are created
-            # lazily on their first collective and can be initialized in a
-            # different order on different pipeline stages.
-            try:
-                parameters = signature(self._dist.new_group).parameters.values()
-            except (TypeError, ValueError):
-                parameters = ()
-            if any(
-                parameter.name == "device_id" or parameter.kind is Parameter.VAR_KEYWORD
-                for parameter in parameters
-            ):
-                kwargs["device_id"] = self.device
+        # Do not pass device_id to subgroup creation. PyTorch implements eager
+        # NCCL subgroup initialization with ncclCommSplit when the default
+        # WORLD group already owns a bound device. On real multi-dimensional
+        # topologies this path can inspect/free a null communicator for ranks
+        # outside a subgroup (Torch 2.4 warns; Torch 2.6/NCCL 2.21 may abort).
+        # Pipeline/model communicators are instead initialized by explicit
+        # ordered warmups before their first P2P exchange.
         return self._dist.new_group(**kwargs)
 
     def is_group_member(self, process_group: Any | None) -> bool:

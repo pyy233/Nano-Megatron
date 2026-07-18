@@ -1,0 +1,106 @@
+distributed:
+  backend: nccl
+  device: cuda
+
+parallel:
+  tensor: 1
+  pipeline: 1
+  context: 1
+  expert: 1
+  data: 8
+  order: [tp, cp, ep, dp, pp]
+  sequence_parallel: false
+
+model:
+  layers: 4
+  hidden_size: 128
+  ffn_hidden_size: 256
+  heads: 8
+  kv_heads: 8
+  seq_length: 64
+  vocab_size: 64
+  dropout: 0.0
+  tie_embeddings: true
+
+precision:
+  params: bfloat16
+  compute: bfloat16
+  grad_reduce: float32
+
+kernels:
+  backend: torch
+
+data_parallel:
+  mode: ddp
+  bucket_bytes: 1048576
+  overlap_grad_reduce: false
+  reshard_after_forward: true
+
+pipeline:
+  schedule: gpipe
+  overlap_p2p: false
+  virtual_stages_per_rank: 1
+  dynamic_activation_shapes: false
+
+context_parallel:
+  backend: all_gather
+  dropout: 0.0
+
+activation_checkpoint:
+  mode: none
+
+offload:
+  optimizer_state: false
+  zero3_params_and_grads: false
+  activations: false
+
+optimizer:
+  name: adamw
+  lr: 0.003
+  weight_decay: 0.0
+  clip_grad_norm: 1.0
+
+lr_scheduler:
+  schedule: cosine
+  warmup_steps: 2
+  decay_steps: 30
+  min_lr: 0.0003
+
+training:
+  micro_batch_size: 2
+  gradient_accumulation_steps: 1
+  max_steps: 30
+  seed: 1234
+  log_interval: 1
+
+checkpoint:
+  directory: checkpoints/8gpu-smoke
+  save_interval: 15
+  async_save: false
+  keep_last: 2
+
+data:
+  path: data/smoke/train.pt
+  mmap_path: null
+  text_path: null
+  tokenizer: null
+  num_workers: 0
+  shuffle: true
+  packed_sequences: false
+
+validation:
+  interval: 5
+  batches: 4
+  data:
+    path: data/smoke/validation.pt
+    mmap_path: null
+    text_path: null
+    tokenizer: null
+    num_workers: 0
+    shuffle: false
+    packed_sequences: false
+
+wandb:
+  enabled: false
+  project: nano-megatron-8gpu-smoke
+  mode: disabled

@@ -11,9 +11,10 @@ from nano_megatron.cli.tokenizer import (
     run_inspect,
     run_inspect_mmap,
     run_preprocess,
+    run_split,
     run_train,
 )
-from nano_megatron.data import MMapTokenCorpus, TokenCorpus
+from nano_megatron.data import MMapTokenCorpus, TokenCorpus, iter_jsonl_text
 from nano_megatron.tokenizer import ByteLevelBPETokenizer
 
 _DOCUMENTS = (
@@ -285,3 +286,84 @@ def test_preprocess_function_rejects_unknown_output_format(tmp_path: Path) -> No
             tokenizer_path,
             output_format="sharded",
         )
+
+
+def test_split_is_deterministic_disjoint_and_keeps_duplicate_text_together(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "stories.jsonl"
+    documents = [f"unique story {index}" for index in range(100)] + ["duplicate"] * 5
+    source.write_text(
+        "".join(json.dumps({"text": text}) + "\n" for text in documents),
+        encoding="utf-8",
+    )
+
+    first = run_split(
+        source,
+        tmp_path / "train-1.jsonl",
+        tmp_path / "validation-1.jsonl",
+        validation_fraction=0.2,
+        seed=17,
+    )
+    second = run_split(
+        source,
+        tmp_path / "train-2.jsonl",
+        tmp_path / "validation-2.jsonl",
+        validation_fraction=0.2,
+        seed=17,
+    )
+
+    train_texts = list(iter_jsonl_text(tmp_path / "train-1.jsonl"))
+    validation_texts = list(iter_jsonl_text(tmp_path / "validation-1.jsonl"))
+    assert first["train_documents"] + first["validation_documents"] == len(documents)
+    assert first["train_documents"] == second["train_documents"]
+    assert (tmp_path / "train-1.jsonl").read_bytes() == (
+        tmp_path / "train-2.jsonl"
+    ).read_bytes()
+    assert (tmp_path / "validation-1.jsonl").read_bytes() == (
+        tmp_path / "validation-2.jsonl"
+    ).read_bytes()
+    assert set(train_texts).isdisjoint(validation_texts)
+    assert ("duplicate" in train_texts) != ("duplicate" in validation_texts)
+    assert train_texts.count("duplicate") + validation_texts.count("duplicate") == 5
+
+
+def test_split_rejects_collisions_and_invalid_fraction(tmp_path: Path) -> None:
+    source = tmp_path / "stories.jsonl"
+    source.write_text('{"text":"one"}\n{"text":"two"}\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="between zero and one"):
+        run_split(source, tmp_path / "train", tmp_path / "validation", validation_fraction=1.0)
+    with pytest.raises(ValueError, match="distinct paths"):
+        run_split(source, source, tmp_path / "validation")
+    occupied = tmp_path / "occupied.jsonl"
+    occupied.touch()
+    with pytest.raises(FileExistsError, match="refusing to overwrite"):
+        run_split(source, occupied, tmp_path / "validation")
+
+
+def test_split_rolls_back_train_output_when_validation_publish_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "stories.jsonl"
+    source.write_text(
+        "".join(json.dumps({"text": f"story {index}"}) + "\n" for index in range(100)),
+        encoding="utf-8",
+    )
+    train_output = tmp_path / "train.jsonl"
+    validation_output = tmp_path / "validation.jsonl"
+    original_replace = Path.replace
+
+    def fail_validation_publish(path: Path, target: Path) -> Path:
+        if target == validation_output:
+            raise OSError("simulated validation publish failure")
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", fail_validation_publish)
+
+    with pytest.raises(OSError, match="simulated validation publish failure"):
+        run_split(source, train_output, validation_output, validation_fraction=0.2)
+
+    assert not train_output.exists()
+    assert not validation_output.exists()

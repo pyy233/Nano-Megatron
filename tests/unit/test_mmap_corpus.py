@@ -15,6 +15,7 @@ from nano_megatron.data.mmap_corpus import (
     MMapCorpusError,
     MMapTokenCorpus,
     preprocess_jsonl_mmap,
+    preprocess_texts_mmap,
 )
 
 
@@ -145,6 +146,75 @@ def test_mmap_without_appended_eos_matches_portable_corpus(tmp_path: Path) -> No
     assert not actual.append_eos
     assert actual.tokens.tolist() == expected.tokens.tolist()
     assert actual.fingerprint == expected.fingerprint
+
+
+def test_mmap_iterable_writer_matches_jsonl_writer(tmp_path: Path) -> None:
+    source = tmp_path / "documents.jsonl"
+    documents = _write_jsonl(source)
+    tokenizer = _Tokenizer()
+    expected = preprocess_jsonl_mmap(source, tmp_path / "jsonl", tokenizer)
+
+    actual = preprocess_texts_mmap(iter(documents), tmp_path / "iterable", tokenizer)
+
+    assert actual.documents == expected.documents
+    assert actual.token_count == expected.token_count
+    assert actual.fingerprint == expected.fingerprint
+    assert actual.document_offsets.tolist() == expected.document_offsets.tolist()
+    assert actual.tokens.tolist() == expected.tokens.tolist()
+
+
+def test_mmap_iterable_writer_rejects_empty_or_invalid_documents(tmp_path: Path) -> None:
+    tokenizer = _Tokenizer()
+
+    with pytest.raises(ValueError, match="zero documents"):
+        preprocess_texts_mmap((), tmp_path / "empty", tokenizer)
+    assert not (tmp_path / "empty").exists()
+
+    with pytest.raises(TypeError, match="must be a string"):
+        preprocess_texts_mmap(["valid", 17], tmp_path / "invalid", tokenizer)  # type: ignore[list-item]
+    assert not (tmp_path / "invalid").exists()
+
+
+def test_mmap_iterable_writer_uses_bounded_batch_encoding(tmp_path: Path) -> None:
+    class BatchTokenizer(_Tokenizer):
+        def __init__(self) -> None:
+            super().__init__()
+            self.batch_sizes: list[int] = []
+
+        def encode_batch(
+            self,
+            texts: list[str],
+            *,
+            add_bos: bool = False,
+            add_eos: bool = False,
+        ) -> list[list[int]]:
+            assert not add_bos
+            assert not add_eos
+            self.batch_sizes.append(len(texts))
+            return [self.encode(text) for text in texts]
+
+    tokenizer = BatchTokenizer()
+    documents = (f"document {index}" for index in range(10))
+
+    corpus = preprocess_texts_mmap(
+        documents,
+        tmp_path / "batched",
+        tokenizer,
+        encoding_batch_size=4,
+    )
+
+    assert corpus.documents == 10
+    assert tokenizer.batch_sizes == [4, 4, 2]
+
+
+def test_mmap_iterable_writer_rejects_invalid_batch_size(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="encoding_batch_size"):
+        preprocess_texts_mmap(
+            ["document"],
+            tmp_path / "invalid-batch",
+            _Tokenizer(),
+            encoding_batch_size=0,
+        )
 
 
 def test_mmap_pickle_drops_open_mapping_and_reopens_lazily(tmp_path: Path) -> None:

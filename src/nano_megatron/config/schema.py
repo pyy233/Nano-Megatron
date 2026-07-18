@@ -65,7 +65,6 @@ class PrecisionDType(StrEnum):
 
 class KernelBackend(StrEnum):
     TORCH = "torch"
-    TRANSFORMER_ENGINE = "transformer_engine"
 
 
 class DataParallelMode(StrEnum):
@@ -90,6 +89,11 @@ class ActivationCheckpointMode(StrEnum):
     NONE = "none"
     FULL = "full"
     SELECTIVE = "selective"
+
+
+class LearningRateSchedule(StrEnum):
+    CONSTANT = "constant"
+    COSINE = "cosine"
 
 
 @dataclass(frozen=True, slots=True)
@@ -460,6 +464,29 @@ class OptimizerConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class LearningRateSchedulerConfig:
+    schedule: LearningRateSchedule = LearningRateSchedule.COSINE
+    warmup_steps: int = 0
+    decay_steps: int | None = None
+    min_lr: float = 0.0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "schedule",
+            _coerce_enum(
+                "lr_scheduler.schedule",
+                LearningRateSchedule,
+                self.schedule,
+            ),
+        )
+        _require_int("lr_scheduler.warmup_steps", self.warmup_steps, minimum=0)
+        if self.decay_steps is not None:
+            _require_int("lr_scheduler.decay_steps", self.decay_steps)
+        _require_positive_float("lr_scheduler.min_lr", self.min_lr, allow_zero=True)
+
+
+@dataclass(frozen=True, slots=True)
 class TrainingConfig:
     micro_batch_size: int = 1
     gradient_accumulation_steps: int = 1
@@ -491,12 +518,16 @@ class CheckpointConfig:
     save_interval: int = 500
     async_save: bool = False
     keep_last: int = 2
+    save_final: bool = True
+    save_best_validation: bool = True
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "directory", Path(self.directory))
         _require_int("checkpoint.save_interval", self.save_interval, minimum=0)
         _require_int("checkpoint.keep_last", self.keep_last)
         _require_bool("checkpoint.async_save", self.async_save)
+        _require_bool("checkpoint.save_final", self.save_final)
+        _require_bool("checkpoint.save_best_validation", self.save_best_validation)
 
 
 @dataclass(frozen=True, slots=True)
@@ -552,6 +583,61 @@ class DataConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ValidationConfig:
+    interval: int = 0
+    batches: int = 10
+    data: DataConfig | None = None
+
+    def __post_init__(self) -> None:
+        _require_int("validation.interval", self.interval, minimum=0)
+        _require_int("validation.batches", self.batches)
+        if self.data is not None and not isinstance(self.data, DataConfig):
+            raise TypeError("validation.data must be a DataConfig or null")
+
+
+@dataclass(frozen=True, slots=True)
+class WandbConfig:
+    enabled: bool = False
+    project: str = "nano-megatron"
+    entity: str | None = None
+    name: str | None = None
+    group: str | None = None
+    tags: tuple[str, ...] = ()
+    mode: str = "online"
+    directory: Path | None = None
+    run_id: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_bool("wandb.enabled", self.enabled)
+        if not isinstance(self.project, str) or not self.project.strip():
+            raise ValueError("wandb.project must be a non-empty string")
+        object.__setattr__(self, "project", self.project.strip())
+        for name in ("entity", "name", "group", "run_id"):
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError(f"wandb.{name} must be a non-empty string or null")
+            if isinstance(value, str):
+                object.__setattr__(self, name, value.strip())
+        if isinstance(self.tags, str):
+            raise TypeError("wandb.tags must be a sequence of strings, not a string")
+        tags = tuple(self.tags)
+        if any(not isinstance(tag, str) or not tag.strip() for tag in tags):
+            raise ValueError("wandb.tags must contain non-empty strings")
+        object.__setattr__(self, "tags", tuple(tag.strip() for tag in tags))
+        if not isinstance(self.mode, str):
+            raise TypeError("wandb.mode must be a string")
+        mode = self.mode.lower().strip()
+        if mode not in {"online", "offline", "disabled"}:
+            raise ValueError("wandb.mode must be online, offline, or disabled")
+        object.__setattr__(self, "mode", mode)
+        object.__setattr__(
+            self,
+            "directory",
+            _optional_path("wandb.directory", self.directory),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class TrainConfig:
     distributed: DistributedConfig = field(default_factory=DistributedConfig)
     parallel: ParallelConfig = field(default_factory=ParallelConfig)
@@ -566,9 +652,14 @@ class TrainConfig:
     )
     offload: OffloadConfig = field(default_factory=OffloadConfig)
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
+    lr_scheduler: LearningRateSchedulerConfig = field(
+        default_factory=LearningRateSchedulerConfig
+    )
     training: TrainingConfig = field(default_factory=TrainingConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     data: DataConfig = field(default_factory=DataConfig)
+    validation: ValidationConfig = field(default_factory=ValidationConfig)
+    wandb: WandbConfig = field(default_factory=WandbConfig)
 
     def global_batch_size(self, *, world_size: int | None = None) -> int:
         return self.training.global_batch_size(self.parallel, world_size=world_size)

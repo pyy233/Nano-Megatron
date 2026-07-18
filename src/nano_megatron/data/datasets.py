@@ -27,8 +27,8 @@ _INTEGER_DTYPES = {
 }
 
 
-def _config_tokenizer_append_eos(config: Any) -> bool:
-    tokenizer_config = getattr(config.data, "tokenizer", None)
+def _config_tokenizer_append_eos(data_config: Any) -> bool:
+    tokenizer_config = getattr(data_config, "tokenizer", None)
     if tokenizer_config is None:
         raise ValueError("data.text_path requires data.tokenizer configuration")
     append_eos = tokenizer_config.append_eos
@@ -286,14 +286,17 @@ class RandomTokenDataset(Dataset[dict[str, Tensor]]):
 def build_train_dataset(
     config: Any,
     tokenizer: TextTokenizer | None = None,
+    *,
+    data_config: Any | None = None,
 ) -> Dataset[dict[str, Tensor]]:
-    """Build random, pre-tokenized, or small deterministic JSONL training data."""
+    """Build random, pre-tokenized, or small deterministic JSONL data."""
 
     sequence_length = int(config.model.seq_length)
     model_vocab_size = int(config.model.vocab_size)
-    text_path = getattr(config.data, "text_path", None)
-    token_path = getattr(config.data, "path", None)
-    mmap_path = getattr(config.data, "mmap_path", None)
+    data = config.data if data_config is None else data_config
+    text_path = getattr(data, "text_path", None)
+    token_path = getattr(data, "path", None)
+    mmap_path = getattr(data, "mmap_path", None)
     configured_sources = sum(path is not None for path in (text_path, token_path, mmap_path))
     if configured_sources > 1:
         raise ValueError("data.path, data.mmap_path and data.text_path are mutually exclusive")
@@ -304,8 +307,8 @@ def build_train_dataset(
         corpus = TokenCorpus.from_jsonl(
             text_path,
             tokenizer,
-            text_key=config.data.text_key,
-            append_eos=_config_tokenizer_append_eos(config),
+            text_key=data.text_key,
+            append_eos=_config_tokenizer_append_eos(data),
         )
         return FixedLengthTokenDataset(
             corpus.tokens,
@@ -314,7 +317,7 @@ def build_train_dataset(
         )
     if mmap_path is not None:
         dataset = MMapTokenDataset(mmap_path, sequence_length)
-        tokenizer_config = getattr(config.data, "tokenizer", None)
+        tokenizer_config = getattr(data, "tokenizer", None)
         if tokenizer_config is not None and tokenizer is None:
             raise ValueError(
                 "data.tokenizer configuration requires an explicitly supplied tokenizer"
@@ -324,14 +327,14 @@ def build_train_dataset(
             model_vocab_size=model_vocab_size,
             tokenizer=tokenizer,
             expected_append_eos=(
-                None if tokenizer_config is None else _config_tokenizer_append_eos(config)
+                None if tokenizer_config is None else _config_tokenizer_append_eos(data)
             ),
             source="mmap token corpus",
         )
         return dataset
     if token_path is not None:
         corpus = TokenCorpus.load(token_path)
-        tokenizer_config = getattr(config.data, "tokenizer", None)
+        tokenizer_config = getattr(data, "tokenizer", None)
         if tokenizer_config is not None and tokenizer is None:
             raise ValueError(
                 "data.tokenizer configuration requires an explicitly supplied tokenizer"
@@ -341,7 +344,7 @@ def build_train_dataset(
             model_vocab_size=model_vocab_size,
             tokenizer=tokenizer,
             expected_append_eos=(
-                None if tokenizer_config is None else _config_tokenizer_append_eos(config)
+                None if tokenizer_config is None else _config_tokenizer_append_eos(data)
             ),
         )
         return FixedLengthTokenDataset(

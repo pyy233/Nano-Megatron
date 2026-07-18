@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import os
 from collections.abc import Sequence
+from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 
 import torch
@@ -12,7 +14,7 @@ import torch
 from nano_megatron.checkpoint import CheckpointManager
 from nano_megatron.config import load_config, validate_config
 from nano_megatron.context_parallel import build_context_parallel_attention
-from nano_megatron.data import build_train_dataloader
+from nano_megatron.data import build_train_dataloader, build_validation_dataloader
 from nano_megatron.data_parallel import build_data_parallel_strategy
 from nano_megatron.distributed import DistributedRuntime
 from nano_megatron.models.gpt import DenseGPTComponents, GPTModelBuilder
@@ -47,13 +49,54 @@ def _dtype(value) -> torch.dtype:
     }[name]
 
 
+def _checkpoint_run_timestamp() -> str:
+    return datetime.now().astimezone().strftime("%Y%m%d-%H%M%S-%f")
+
+
+def _allocate_checkpoint_run_directory(base: Path, runtime: DistributedRuntime) -> Path:
+    """Create one timestamped checkpoint directory and publish it from rank zero."""
+
+    local_result: tuple[str | None, str | None] | None = None
+    if runtime.is_primary:
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+            timestamp = _checkpoint_run_timestamp()
+            candidate = base / timestamp
+            suffix = 0
+            while True:
+                try:
+                    candidate.mkdir(parents=False, exist_ok=False)
+                    break
+                except FileExistsError:
+                    suffix += 1
+                    candidate = base / f"{timestamp}-{suffix:02d}"
+            local_result = (str(candidate), None)
+        except BaseException as error:
+            local_result = (None, f"{type(error).__name__}: {error}")
+
+    gathered = runtime.all_gather_object(local_result)
+    coordinator_result = gathered[0]
+    if not isinstance(coordinator_result, tuple) or len(coordinator_result) != 2:
+        raise RuntimeError("rank 0 returned an invalid checkpoint directory result")
+    directory, error = coordinator_result
+    if error is not None:
+        raise RuntimeError(f"failed to allocate checkpoint run directory: {error}")
+    if not isinstance(directory, str) or not directory:
+        raise RuntimeError("rank 0 returned an empty checkpoint run directory")
+    return Path(directory)
+
+
 def run(config_path: Path, *, overrides: Sequence[str], resume: Path | None, max_steps: int | None):
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     config = load_config(config_path, overrides=overrides, world_size=world_size)
     validate_config(config, world_size=world_size)
     tokenizer = None
-    if config.data.tokenizer is not None:
-        tokenizer = ByteLevelBPETokenizer.load(config.data.tokenizer.path)
+    validation_data = config.validation.data
+    tokenizer_config = config.data.tokenizer
+    if tokenizer_config is None and validation_data is not None:
+        tokenizer_config = validation_data.tokenizer
+    if tokenizer_config is not None:
+        tokenizer = ByteLevelBPETokenizer.load(tokenizer_config.path)
         validate_tokenizer_for_model(tokenizer, config.model)
 
     with (
@@ -89,6 +132,19 @@ def run(config_path: Path, *, overrides: Sequence[str], resume: Path | None, max
             parallel,
             built.parameter_domains,
         )
+        checkpoint_run_directory = _allocate_checkpoint_run_directory(
+            config.checkpoint.directory,
+            runtime,
+        )
+        config = replace(
+            config,
+            checkpoint=replace(
+                config.checkpoint,
+                directory=checkpoint_run_directory,
+            ),
+        )
+        if runtime.is_primary:
+            print(f"checkpoint run directory: {checkpoint_run_directory}")
         checkpoint = CheckpointManager(
             config=config.checkpoint,
             parallel=parallel,
@@ -101,6 +157,10 @@ def run(config_path: Path, *, overrides: Sequence[str], resume: Path | None, max
             data_parallel=strategy,
             checkpoint=checkpoint,
             data_iterator=None,
+            metrics_path=checkpoint_run_directory / "metrics.jsonl",
+            resume_metrics_path=(
+                None if resume is None else resume.parent / "metrics.jsonl"
+            ),
             rng=rng,
         )
         try:
@@ -111,8 +171,6 @@ def run(config_path: Path, *, overrides: Sequence[str], resume: Path | None, max
                 parallel,
                 tokenizer=tokenizer,
                 max_steps=max_steps,
-                start_step=trainer.state.step,
-                consumed_samples=trainer.state.consumed_samples,
             )
             data_fingerprint = (
                 getattr(data, "data_fingerprint", None) if trainer.batch_router.is_source else None
@@ -126,8 +184,13 @@ def run(config_path: Path, *, overrides: Sequence[str], resume: Path | None, max
                 )
             else:
                 trainer.data_iterator = iter(data)
-            if resume is not None:
-                trainer.restore_data_position()
+            if config.validation.interval > 0:
+                validation_loader = build_validation_dataloader(
+                    config,
+                    parallel,
+                    tokenizer=tokenizer,
+                )
+                trainer.bind_validation_data(validation_loader)
             state = trainer.fit(max_steps=max_steps)
         finally:
             trainer.close()

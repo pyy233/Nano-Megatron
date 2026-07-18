@@ -100,6 +100,8 @@ def test_factory_and_single_process_step(mode: str, strategy_type: type) -> None
             OptimizerConfig(lr=0.01, weight_decay=0.0),
             registry,
         )
+        strategy.set_learning_rate(0.005)
+        assert strategy.learning_rate == pytest.approx(0.005)
         before = [parameter.detach().clone() for parameter in model.parameters()]
         loss = wrapped(torch.ones(4, 3)).square().mean()
         strategy.backward(loss)

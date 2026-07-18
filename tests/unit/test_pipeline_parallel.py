@@ -298,6 +298,44 @@ def test_gpipe_reports_average_loss_metric_over_microbatches() -> None:
         forward_only=True,
     )
     assert output.metrics["loss"] == pytest.approx(2.0)
+    assert output.metrics["loss_sum"] == pytest.approx(4.0)
+    assert output.metrics["token_count"] == pytest.approx(2.0)
+
+
+def test_gpipe_loss_totals_ignore_masked_tokens_without_fake_weight() -> None:
+    class Parallel:
+        @staticmethod
+        def is_pipeline_first_stage() -> bool:
+            return True
+
+        @staticmethod
+        def is_pipeline_last_stage() -> bool:
+            return True
+
+        @staticmethod
+        def pipeline_prev_rank() -> None:
+            return None
+
+        @staticmethod
+        def pipeline_next_rank() -> None:
+            return None
+
+    class Stage:
+        def __call__(self, hidden_states, batch):
+            del hidden_states
+            return batch["value"]
+
+    output = GPipeSchedule(Parallel()).forward_backward(
+        stage=Stage(),
+        microbatches=[
+            {"value": torch.tensor(5.0), "labels": torch.tensor([[1, -100]])},
+            {"value": torch.tensor(7.0), "labels": torch.tensor([[-100, -100]])},
+        ],
+        forward_only=True,
+    )
+
+    assert output.metrics["loss_sum"] == pytest.approx(5.0)
+    assert output.metrics["token_count"] == pytest.approx(1.0)
 
 
 def test_gpipe_rejects_structured_outputs_at_the_sharding_boundary() -> None:

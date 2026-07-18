@@ -44,6 +44,7 @@ class FlatShardZeROStrategy(DataParallelStrategy):
         self._states: list[_AdamShard] = []
         self._storages: list[OptimizerStateStorage] = []
         self._optimizer_config: object | None = None
+        self._learning_rate: float | None = None
         self._step = 0
         self._gradients_ready = False
         self.gradient_reducer: BucketGradientReducer | None = None
@@ -73,6 +74,7 @@ class FlatShardZeROStrategy(DataParallelStrategy):
             is_final_backward=lambda: self._sync_this_backward,
         )
         self._optimizer_config = optimizer_config
+        self._learning_rate = float(config_value(optimizer_config, "lr", 3.0e-4))
         self._model = model
         self._initialize_shards()
         return model
@@ -169,7 +171,7 @@ class FlatShardZeROStrategy(DataParallelStrategy):
             self._reduce_gradients()
 
         self._step += 1
-        lr = float(config_value(self._optimizer_config, "lr", 3.0e-4))
+        lr = self.learning_rate
         beta1, beta2 = tuple(config_value(self._optimizer_config, "betas", (0.9, 0.95)))
         eps = float(config_value(self._optimizer_config, "eps", 1.0e-8))
         weight_decay = float(config_value(self._optimizer_config, "weight_decay", 0.0))
@@ -195,6 +197,20 @@ class FlatShardZeROStrategy(DataParallelStrategy):
             )
             full_parameter = bucket.all_gather_shards(collective_shard)
             bucket.unpack_parameters(full_parameter)
+
+    def set_learning_rate(self, learning_rate: float) -> None:
+        value = float(learning_rate)
+        if value < 0.0:
+            raise ValueError("learning rate must be non-negative")
+        if self._optimizer_config is None:
+            raise RuntimeError(f"{type(self).__name__}.setup() must be called before setting LR")
+        self._learning_rate = value
+
+    @property
+    def learning_rate(self) -> float:
+        if self._optimizer_config is None or self._learning_rate is None:
+            raise RuntimeError(f"{type(self).__name__}.setup() must be called before reading LR")
+        return self._learning_rate
 
     def zero_grad(self) -> None:
         if self.gradient_reducer is None:
@@ -226,7 +242,12 @@ class FlatShardZeROStrategy(DataParallelStrategy):
                 "exp_avg": self._gather_state_tensor(bucket, state.exp_avg),
                 "exp_avg_sq": self._gather_state_tensor(bucket, state.exp_avg_sq),
             }
-        return {"mode": self.mode, "step": self._step, "buckets": bucket_states}
+        return {
+            "mode": self.mode,
+            "step": self._step,
+            "learning_rate": self.learning_rate,
+            "buckets": bucket_states,
+        }
 
     @torch.no_grad()
     def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
@@ -277,3 +298,4 @@ class FlatShardZeROStrategy(DataParallelStrategy):
                     local.to(target.device), non_blocking=self.offload_policy.non_blocking
                 )
         self._step = int(state_dict.get("step", 0))
+        self.set_learning_rate(float(state_dict.get("learning_rate", self.learning_rate)))

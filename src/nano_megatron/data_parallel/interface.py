@@ -153,6 +153,19 @@ class DataParallelStrategy(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def set_learning_rate(self, learning_rate: float) -> None:
+        """Set the rate used by the next optimizer update."""
+
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def learning_rate(self) -> float:
+        """Return the rate that will be used by the next optimizer update."""
+
+        raise NotImplementedError
+
+    @abstractmethod
     def zero_grad(self) -> None:
         raise NotImplementedError
 

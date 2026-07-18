@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import uuid
 from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
@@ -57,6 +59,17 @@ def _parser() -> argparse.ArgumentParser:
         default=True,
         help="append exactly one EOS token after each document",
     )
+
+    split = commands.add_parser(
+        "split",
+        help="deterministically split JSONL documents into train and validation files",
+    )
+    split.add_argument("--input", type=Path, required=True)
+    split.add_argument("--train-output", type=Path, required=True)
+    split.add_argument("--validation-output", type=Path, required=True)
+    split.add_argument("--validation-fraction", type=float, default=0.1)
+    split.add_argument("--seed", type=int, default=1234)
+    split.add_argument("--text-key", default="text")
 
     inspect = commands.add_parser(
         "inspect", help="inspect a tokenizer encoding or mmap corpus metadata"
@@ -180,6 +193,98 @@ def run_preprocess(
     }
 
 
+def run_split(
+    input_path: Path,
+    train_output: Path,
+    validation_output: Path,
+    *,
+    validation_fraction: float = 0.1,
+    seed: int = 1234,
+    text_key: str = "text",
+) -> dict[str, Any]:
+    """Stream a stable, order-independent document split into two JSONL files."""
+
+    if (
+        isinstance(validation_fraction, bool)
+        or not isinstance(validation_fraction, (int, float))
+        or not 0.0 < validation_fraction < 1.0
+    ):
+        raise ValueError("validation_fraction must be between zero and one")
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise ValueError("split seed must be a non-negative integer")
+    source = input_path.resolve()
+    train_target = train_output.resolve()
+    validation_target = validation_output.resolve()
+    if len({source, train_target, validation_target}) != 3:
+        raise ValueError("input, train output, and validation output must be distinct paths")
+    for target in (train_target, validation_target):
+        if target.exists():
+            raise FileExistsError(f"refusing to overwrite existing split output: {target}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+    suffix = uuid.uuid4().hex
+    train_temporary = train_target.with_name(f".{train_target.name}.{suffix}.tmp")
+    validation_temporary = validation_target.with_name(
+        f".{validation_target.name}.{suffix}.tmp"
+    )
+    threshold = int(float(validation_fraction) * (1 << 64))
+    train_documents = 0
+    validation_documents = 0
+    train_published = False
+    try:
+        with (
+            train_temporary.open("x", encoding="utf-8", newline="\n") as train_stream,
+            validation_temporary.open(
+                "x",
+                encoding="utf-8",
+                newline="\n",
+            ) as validation_stream,
+        ):
+            for text in iter_jsonl_text(source, text_key=text_key):
+                digest = hashlib.sha256(
+                    f"nano-megatron-jsonl-split-v1\0{seed}\0{text}".encode()
+                ).digest()
+                is_validation = int.from_bytes(digest[:8], "big") < threshold
+                stream = validation_stream if is_validation else train_stream
+                stream.write(
+                    json.dumps(
+                        {text_key: text},
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                )
+                if is_validation:
+                    validation_documents += 1
+                else:
+                    train_documents += 1
+        if train_documents == 0 or validation_documents == 0:
+            raise ValueError(
+                "the deterministic split produced an empty partition; use more documents "
+                "or a different validation fraction/seed"
+            )
+        train_temporary.replace(train_target)
+        train_published = True
+        validation_temporary.replace(validation_target)
+    except BaseException:
+        train_temporary.unlink(missing_ok=True)
+        validation_temporary.unlink(missing_ok=True)
+        if train_published:
+            train_target.unlink(missing_ok=True)
+        raise
+
+    return {
+        "command": "split",
+        "input": str(source),
+        "seed": seed,
+        "train_documents": train_documents,
+        "train_output": str(train_target),
+        "validation_documents": validation_documents,
+        "validation_fraction": float(validation_fraction),
+        "validation_output": str(validation_target),
+    }
+
+
 def run_inspect(
     tokenizer_path: Path,
     text: str,
@@ -250,6 +355,15 @@ def main(argv: Sequence[str] | None = None) -> None:
             text_key=args.text_key,
             append_eos=args.append_eos,
             output_format=args.format,
+        )
+    elif args.command == "split":
+        result = run_split(
+            args.input,
+            args.train_output,
+            args.validation_output,
+            validation_fraction=args.validation_fraction,
+            seed=args.seed,
+            text_key=args.text_key,
         )
     elif args.command == "inspect":
         if args.mmap is not None:

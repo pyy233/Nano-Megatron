@@ -65,7 +65,10 @@ def _reduce_scatter(x: Tensor, group: ParallelGroupLike, dim: int) -> Tensor:
     output_shape = list(moved.shape)
     output_shape[0] //= group.size
     output = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-    dist.reduce_scatter_tensor(output, moved, group=process_group)
+    reduce_scatter = getattr(dist, "reduce_scatter_single", None)
+    if reduce_scatter is None:
+        reduce_scatter = dist.reduce_scatter_tensor  # pyright: ignore[reportDeprecated]
+    reduce_scatter(output, moved, group=process_group)
     return output.movedim(0, dim).contiguous()
 
 

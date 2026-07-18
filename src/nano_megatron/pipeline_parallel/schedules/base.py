@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager, nullcontext
 from typing import Any
 
@@ -99,12 +99,31 @@ def backward(strategy: Any, loss_or_output: Tensor, gradient: Tensor | None = No
         loss_or_output.backward()
 
 
-def extract_loss(value: Tensor, divisor: int) -> tuple[Tensor, dict[str, float]]:
+def _loss_token_count(batch: Any) -> int:
+    if not isinstance(batch, Mapping):
+        return 1
+    labels = batch.get("labels")
+    if not isinstance(labels, Tensor):
+        return 1
+    return int((labels != -100).sum().detach().cpu())
+
+
+def extract_loss(
+    value: Tensor,
+    divisor: int,
+    batch: Any | None = None,
+) -> tuple[Tensor, dict[str, float]]:
     if not isinstance(value, Tensor):
         raise TypeError("pipeline stages must return a Tensor")
     if value.ndim != 0:
         raise TypeError("the last pipeline stage must return a scalar loss Tensor")
-    return value / divisor, {"loss": float(value.detach().cpu())}
+    loss = float(value.detach().cpu())
+    token_count = _loss_token_count(batch)
+    return value / divisor, {
+        "loss": loss,
+        "loss_sum": loss * token_count,
+        "token_count": float(token_count),
+    }
 
 
 def accumulate_metrics(
@@ -118,4 +137,8 @@ def accumulate_metrics(
 
 
 def average_metrics(sums: dict[str, float], counts: dict[str, int]) -> dict[str, float]:
-    return {name: value / counts[name] for name, value in sums.items()}
+    additive = {"loss_sum", "token_count"}
+    return {
+        name: value if name in additive else value / counts[name]
+        for name, value in sums.items()
+    }

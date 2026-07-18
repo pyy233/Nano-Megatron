@@ -14,10 +14,34 @@ def test_trainer_state_round_trip() -> None:
         consumed_samples=48,
         consumed_tokens=96,
         data_fingerprint="corpus-v1",
+        data_epoch=2,
+        data_shuffle_seed=17,
+        data_sample_offset=8,
+        data_samples_per_epoch=40,
+        lr_scheduler={"completed_steps": 3},
+        wandb_run_id="run-123",
+        metrics_history={"version": 1, "last_sequence": 4, "last_step": 3},
+        best_validation_loss=2.5,
+        best_validation_step=2,
+        best_validation_checkpoint="checkpoints/run/step_00000002",
     )
     restored = TrainerState()
     restored.load_state_dict(state.state_dict())
     assert restored == state
+
+
+def test_trainer_state_rejects_partial_or_invalid_best_validation_state() -> None:
+    with pytest.raises(ValueError, match="requires best validation metrics"):
+        TrainerState().load_state_dict(
+            {"best_validation_checkpoint": "step_00000001"}
+        )
+    with pytest.raises(ValueError, match="best_validation_loss"):
+        TrainerState().load_state_dict(
+            {
+                "best_validation_loss": float("nan"),
+                "best_validation_step": 1,
+            }
+        )
 
 
 def test_bind_data_iterator_rejects_checkpoint_data_identity_change() -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from itertools import islice
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,7 +20,6 @@ from nano_megatron.data import (  # noqa: E402
     iter_jsonl_text,
     preprocess_jsonl,
 )
-from nano_megatron.training import Trainer, TrainerState  # noqa: E402
 
 
 class FakeTokenizer:
@@ -489,7 +489,7 @@ def test_loader_shards_samples_across_dp_ep_replicas(tmp_path: Path) -> None:
     assert len(loader_one) >= config.training.max_steps
 
 
-def test_loader_preflight_accounts_for_both_drop_last_levels(tmp_path: Path) -> None:
+def test_loader_cycles_after_one_complete_drop_last_epoch(tmp_path: Path) -> None:
     path = tmp_path / "tokens.pt"
     # Seven GPT samples become three samples per replica, then only one full local batch.
     torch.save(torch.arange(15) % 32, path)
@@ -500,11 +500,19 @@ def test_loader_preflight_accounts_for_both_drop_last_levels(tmp_path: Path) -> 
         micro_batch_size=2,
     )
 
-    with pytest.raises(ValueError, match="need at least 8 samples"):
-        build_train_dataloader(config, _parallel(expert_size=2, replica_count=2))
+    loader = build_train_dataloader(
+        config,
+        _parallel(expert_size=2, replica_count=2),
+    )
+
+    assert len(loader) == 1
+    next(loader)
+    assert loader.state_dict()["epoch"] == 1
+    next(loader)
+    assert loader.state_dict()["epoch"] == 2
 
 
-def test_loader_capacity_uses_invocation_max_steps_override(tmp_path: Path) -> None:
+def test_loader_real_dataset_capacity_is_per_epoch_not_whole_run(tmp_path: Path) -> None:
     path = tmp_path / "tokens.pt"
     # Four samples are enough for one local batch/step, but not config.max_steps=3.
     torch.save(torch.arange(9) % 32, path)
@@ -515,10 +523,12 @@ def test_loader_capacity_uses_invocation_max_steps_override(tmp_path: Path) -> N
         micro_batch_size=4,
     )
 
-    loader = build_train_dataloader(config, _parallel(), max_steps=1)
+    loader = build_train_dataloader(config, _parallel())
+
     assert len(loader) == 1
-    with pytest.raises(ValueError, match="3 batches per replica"):
-        build_train_dataloader(config, _parallel())
+    batches = list(islice(loader, 3))
+    assert len(batches) == 3
+    assert loader.state_dict()["epoch"] == 3
 
 
 def test_loader_rejects_invalid_invocation_max_steps() -> None:
@@ -528,41 +538,28 @@ def test_loader_rejects_invalid_invocation_max_steps() -> None:
         build_train_dataloader(config, _parallel(), max_steps=0)
 
 
-@pytest.mark.parametrize(
-    ("replica_count", "start_step", "consumed_samples", "target_step", "required"),
-    [
-        (2, 10, 10, 20, 30),
-        (1, 10, 20, 20, 30),
-    ],
-)
-def test_loader_capacity_accounts_for_resume_and_replica_degree_change(
+def test_loader_legacy_consumed_samples_are_converted_to_epoch_and_offset(
     tmp_path: Path,
-    replica_count: int,
-    start_step: int,
-    consumed_samples: int,
-    target_step: int,
-    required: int,
 ) -> None:
     path = tmp_path / "tokens.pt"
-    # sequence_length=1 gives one sample per token transition.
-    torch.save(torch.arange(required + 1) % 32, path)
-    config = _config(path=path, sequence_length=1, max_steps=target_step)
+    torch.save(torch.arange(13) % 32, path)
+    config = _config(path=path, sequence_length=1, max_steps=20)
 
     loader = build_train_dataloader(
         config,
-        _parallel(replica_count=replica_count),
-        max_steps=target_step,
-        start_step=start_step,
-        consumed_samples=consumed_samples,
+        _parallel(replica_count=2),
+        start_step=4,
+        consumed_samples=8,
     )
 
-    assert len(loader.dataset) == required
+    assert loader.state_dict()["epoch"] == 0
+    assert loader.state_dict()["sample_offset"] == 8
 
 
 def test_loader_resume_rejects_consumed_samples_incompatible_with_current_batch() -> None:
     config = _config(max_steps=2)
 
-    with pytest.raises(ValueError, match="consumed_samples is incompatible"):
+    with pytest.raises(RuntimeError, match="global batch size"):
         build_train_dataloader(
             config,
             _parallel(replica_count=2),
@@ -611,8 +608,8 @@ def test_num_workers_zero_and_two_emit_identical_token_batches(tmp_path: Path) -
         _parallel(),
     )
 
-    single_batches = list(single)
-    worker_batches = list(workers)
+    single_batches = list(islice(single, len(single)))
+    worker_batches = list(islice(workers, len(workers)))
     assert len(single_batches) == len(worker_batches)
     for expected, actual in zip(single_batches, worker_batches, strict=True):
         torch.testing.assert_close(actual["input_ids"], expected["input_ids"])
@@ -654,31 +651,57 @@ def test_distributed_sampler_degree_change_preserves_consumed_global_prefix(
     assert old[consumed_samples:] == new[consumed_samples:]
 
 
-def test_token_loader_resume_replays_to_the_exact_next_shuffled_batch(
+def test_token_loader_state_restores_exact_next_shuffled_batch(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "tokens.pt"
     torch.save(torch.arange(65) % 32, path)
     config = _config(path=path, sequence_length=2, max_steps=3, shuffle=True)
     first_loader = build_train_dataloader(config, _parallel())
-    first_iterator = iter(first_loader)
-    next(first_iterator)
-    expected = next(first_iterator)
+    next(first_loader)
+    saved = first_loader.state_dict()
+    expected = next(first_loader)
 
-    resumed_loader = build_train_dataloader(
-        config,
-        _parallel(),
-        start_step=1,
-        consumed_samples=1,
-    )
-    trainer = object.__new__(Trainer)
-    trainer.state = TrainerState(step=1, consumed_samples=1)
-    trainer.data_iterator = iter(resumed_loader)
-    trainer._data_batches_consumed = 0
-    trainer.batch_router = SimpleNamespace(is_source=True, data_replica_count=1)
-    trainer.config = config
-    trainer.restore_data_position()
-    actual = next(trainer.data_iterator)
+    resumed_loader = build_train_dataloader(config, _parallel())
+    resumed_loader.load_state_dict(saved)
+    actual = next(resumed_loader)
 
     torch.testing.assert_close(actual["input_ids"], expected["input_ids"])
     torch.testing.assert_close(actual["labels"], expected["labels"])
+
+
+def test_loader_state_tracks_epoch_seed_and_global_sample_position(tmp_path: Path) -> None:
+    path = tmp_path / "tokens.pt"
+    torch.save(torch.arange(9) % 32, path)
+    config = _config(path=path, sequence_length=1, max_steps=10, shuffle=True)
+    loader = build_train_dataloader(config, _parallel())
+
+    first_epoch = [next(loader)["input_ids"].clone() for _ in range(len(loader))]
+    state = loader.state_dict()
+
+    assert state["epoch"] == 1
+    assert state["shuffle_seed"] == config.training.seed
+    assert state["epoch_seed"] == config.training.seed + 1
+    assert state["sample_offset"] == 0
+    second_epoch = [next(loader)["input_ids"].clone() for _ in range(len(loader))]
+    assert any(
+        not torch.equal(first, second)
+        for first, second in zip(first_epoch, second_epoch, strict=True)
+    )
+
+
+def test_worker_prefetch_does_not_advance_checkpointed_sample_offset(tmp_path: Path) -> None:
+    path = tmp_path / "tokens.pt"
+    torch.save(torch.arange(65) % 32, path)
+    config = _config(
+        path=path,
+        sequence_length=2,
+        max_steps=10,
+        num_workers=2,
+        micro_batch_size=2,
+    )
+    loader = build_train_dataloader(config, _parallel())
+
+    next(loader)
+
+    assert loader.state_dict()["sample_offset"] == 2

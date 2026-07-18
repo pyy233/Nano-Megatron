@@ -164,7 +164,7 @@ def test_tokenized_data_checkpoint_resume_restores_next_batch_position(
     )
 
     first = run(config_path, overrides=(), resume=None, max_steps=1)
-    checkpoint = tmp_path / "checkpoints" / "step_00000001"
+    checkpoint = next((tmp_path / "checkpoints").glob("*/step_00000001"))
     resumed = run(config_path, overrides=(), resume=checkpoint, max_steps=2)
 
     assert checkpoint.is_dir()
@@ -208,6 +208,6 @@ def test_tokenized_resume_rejects_replaced_corpus_at_the_same_path(
     tokens_path.unlink()
     replacement.save(tokens_path)
 
-    checkpoint = tmp_path / "checkpoints" / "step_00000001"
+    checkpoint = next((tmp_path / "checkpoints").glob("*/step_00000001"))
     with pytest.raises(RuntimeError, match="data fingerprint does not match"):
         run(config_path, overrides=(), resume=checkpoint, max_steps=2)

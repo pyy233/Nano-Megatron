@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from .schema import (
     ActivationCheckpointMode,
+    DataConfig,
     DataParallelMode,
     PipelineSchedule,
     PrecisionDType,
@@ -26,6 +27,36 @@ class ValidationResult:
     warnings: tuple[str, ...] = ()
 
 
+def _validate_data_source(
+    data: DataConfig,
+    *,
+    prefix: str,
+    errors: list[str],
+    require_source: bool = False,
+) -> None:
+    sources = (data.path, data.mmap_path, data.text_path)
+    configured = sum(source is not None for source in sources)
+    if configured > 1:
+        errors.append(
+            f"{prefix}.path, {prefix}.mmap_path, and {prefix}.text_path are "
+            "mutually exclusive; at most one may be set"
+        )
+    if require_source and configured == 0:
+        errors.append(f"{prefix} must configure path, mmap_path, or text_path")
+    if data.text_path is not None and data.tokenizer is None:
+        errors.append(f"{prefix}.text_path requires {prefix}.tokenizer")
+    if data.tokenizer is not None and configured == 0:
+        errors.append(
+            f"{prefix}.tokenizer requires {prefix}.path, {prefix}.mmap_path, "
+            f"or {prefix}.text_path"
+        )
+    if data.packed_sequences:
+        errors.append(
+            f"{prefix}.packed_sequences=true is not supported; document-aware "
+            "attention masks are not implemented"
+        )
+
+
 def validate_config(
     config: TrainConfig,
     *,
@@ -42,6 +73,22 @@ def validate_config(
     notices: list[str] = []
     parallel = config.parallel
     model = config.model
+
+    scheduler_decay_steps = (
+        config.training.max_steps
+        if config.lr_scheduler.decay_steps is None
+        else config.lr_scheduler.decay_steps
+    )
+    if config.lr_scheduler.warmup_steps > scheduler_decay_steps:
+        errors.append(
+            "lr_scheduler.warmup_steps cannot exceed the effective decay horizon: "
+            f"{config.lr_scheduler.warmup_steps} > {scheduler_decay_steps}"
+        )
+    if config.lr_scheduler.min_lr > config.optimizer.lr:
+        errors.append(
+            "lr_scheduler.min_lr cannot exceed optimizer.lr: "
+            f"{config.lr_scheduler.min_lr} > {config.optimizer.lr}"
+        )
 
     if (
         config.precision.compute is PrecisionDType.FLOAT32
@@ -129,29 +176,27 @@ def validate_config(
             f"({config.training.gradient_accumulation_steps}) < PP ({parallel.pipeline})"
         )
 
-    configured_data_sources = sum(
-        source is not None
-        for source in (config.data.path, config.data.mmap_path, config.data.text_path)
-    )
-    if configured_data_sources > 1:
-        errors.append(
-            "data.path, data.mmap_path, and data.text_path are mutually exclusive; "
-            "at most one may be set"
-        )
-    if config.data.text_path is not None and config.data.tokenizer is None:
-        errors.append("data.text_path requires data.tokenizer")
+    _validate_data_source(config.data, prefix="data", errors=errors)
+    validation_data = config.validation.data
+    if config.validation.interval > 0:
+        if validation_data is None:
+            errors.append("validation.interval > 0 requires validation.data")
+        else:
+            _validate_data_source(
+                validation_data,
+                prefix="validation.data",
+                errors=errors,
+                require_source=True,
+            )
+    elif validation_data is not None:
+        notices.append("validation.data is configured but validation.interval=0 disables it")
     if (
-        config.data.tokenizer is not None
-        and config.data.path is None
-        and config.data.mmap_path is None
-        and config.data.text_path is None
+        validation_data is not None
+        and validation_data.tokenizer is not None
+        and config.data.tokenizer is not None
+        and validation_data.tokenizer.path != config.data.tokenizer.path
     ):
-        errors.append("data.tokenizer requires data.path, data.mmap_path, or data.text_path")
-    if config.data.packed_sequences:
-        errors.append(
-            "data.packed_sequences=true is not supported; document-aware attention masks "
-            "are not implemented"
-        )
+        errors.append("training and validation data must use the same tokenizer artifact")
     if parallel.context > 1 and model.dropout > 0.0:
         errors.append(
             "model.dropout must be 0 when context parallelism is enabled in phase one; "

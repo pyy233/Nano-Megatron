@@ -7,7 +7,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DistributedSampler
 
 from nano_megatron.config import (
     DataConfig,
@@ -17,7 +17,12 @@ from nano_megatron.config import (
     TrainConfig,
     TrainingConfig,
 )
-from nano_megatron.data import TokenCorpus, build_train_dataloader, preprocess_jsonl_mmap
+from nano_megatron.data import (
+    StatefulDataLoader,
+    TokenCorpus,
+    build_train_dataloader,
+    preprocess_jsonl_mmap,
+)
 from nano_megatron.distributed import DistributedRuntime
 from nano_megatron.parallel import ParallelContext
 
@@ -136,7 +141,7 @@ def _sampler_worker(
                 _train_config(token_path, parallel_config, mmap=is_mmap),
                 parallel,
             )
-            assert isinstance(loader, DataLoader)
+            assert isinstance(loader, StatefulDataLoader)
             assert isinstance(loader.sampler, DistributedSampler)
             assert len(loader.dataset) == _EXPECTED_SAMPLES
 
@@ -164,7 +169,7 @@ def _tensor_source_worker(rank: int, rendezvous: str, mmap_path: str) -> None:
             _train_config(mmap_path, parallel_config, mmap=True),
             parallel,
         )
-        is_loader = isinstance(loader, DataLoader)
+        is_loader = isinstance(loader, StatefulDataLoader)
         is_empty = False if is_loader else list(loader) == []
         local = {
             "batch_replica_rank": parallel.batch_replica.rank,

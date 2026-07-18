@@ -38,6 +38,11 @@ def test_config_from_dict_is_recursive_strict_and_typed() -> None:
             "data_parallel": {"mode": "zero2"},
             "context_parallel": {"backend": "ring", "dropout": 0.0},
             "optimizer": {"betas": [0.8, 0.9]},
+            "lr_scheduler": {
+                "schedule": "constant",
+                "warmup_steps": 2,
+                "min_lr": 0.0,
+            },
             "checkpoint": {"directory": "tmp/checkpoints"},
             "data": {
                 "text_path": "data/train.jsonl",
@@ -46,6 +51,17 @@ def test_config_from_dict_is_recursive_strict_and_typed() -> None:
                     "path": "artifacts/tokenizer",
                     "append_eos": False,
                 },
+            },
+            "validation": {
+                "interval": 5,
+                "batches": 2,
+                "data": {"path": "data/validation.pt", "shuffle": False},
+            },
+            "wandb": {
+                "enabled": True,
+                "project": "tests",
+                "tags": ["cpu"],
+                "mode": "offline",
             },
         }
     )
@@ -56,12 +72,19 @@ def test_config_from_dict_is_recursive_strict_and_typed() -> None:
     assert config.data_parallel.mode is DataParallelMode.ZERO2
     assert config.context_parallel.backend.value == "ring"
     assert config.optimizer.betas == (0.8, 0.9)
+    assert config.lr_scheduler.schedule.value == "constant"
+    assert config.lr_scheduler.warmup_steps == 2
     assert config.checkpoint.directory == Path("tmp/checkpoints")
     assert config.data.text_path == Path("data/train.jsonl")
     assert config.data.text_key == "story"
     assert config.data.tokenizer is not None
     assert config.data.tokenizer.path == Path("artifacts/tokenizer")
     assert not config.data.tokenizer.append_eos
+    assert config.validation.interval == 5
+    assert config.validation.data is not None
+    assert config.validation.data.path == Path("data/validation.pt")
+    assert config.wandb.enabled
+    assert config.wandb.tags == ("cpu",)
 
 
 @pytest.mark.parametrize(

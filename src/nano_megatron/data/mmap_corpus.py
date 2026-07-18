@@ -7,7 +7,7 @@ import json
 import os
 import shutil
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -436,18 +436,24 @@ def _validate_save_target(directory: Path) -> bool:
     return True
 
 
-def preprocess_jsonl_mmap(
-    input_path: str | Path,
+def preprocess_texts_mmap(
+    texts: Iterable[str],
     output_path: str | Path,
     tokenizer: TextTokenizer,
     *,
-    text_key: str = "text",
     append_eos: bool = True,
+    encoding_batch_size: int = 1024,
 ) -> MMapTokenCorpus:
-    """Stream one JSONL corpus into an atomically published mmap artifact."""
+    """Stream an iterable of documents into an atomically published mmap artifact."""
 
     if not isinstance(append_eos, bool):
         raise TypeError("append_eos must be a boolean")
+    if (
+        isinstance(encoding_batch_size, bool)
+        or not isinstance(encoding_batch_size, int)
+        or encoding_batch_size < 1
+    ):
+        raise ValueError("encoding_batch_size must be a positive integer")
     vocab_size, eos_id, tokenizer_fingerprint = _validate_tokenizer(tokenizer)
     token_dtype = _token_dtype_for_vocab(vocab_size)
     destination = Path(output_path)
@@ -467,29 +473,70 @@ def preprocess_jsonl_mmap(
             initial_offset = np.asarray([0], dtype=_OFFSET_DTYPE).tobytes(order="C")
             offset_stream.write(initial_offset)
             offsets_digest.update(initial_offset)
-            for documents, text in enumerate(
-                iter_jsonl_text(input_path, text_key=text_key),
-                start=1,
-            ):
-                token_ids = _validate_token_ids(
-                    tokenizer.encode(text, add_bos=False, add_eos=False),
-                    document=documents,
-                    vocab_size=vocab_size,
-                )
-                encoded = np.asarray(token_ids, dtype=token_dtype).tobytes(order="C")
-                token_stream.write(encoded)
-                tokens_digest.update(encoded)
-                token_count += len(token_ids)
-                if append_eos:
-                    encoded_eos = np.asarray([eos_id], dtype=token_dtype).tobytes(order="C")
-                    token_stream.write(encoded_eos)
-                    tokens_digest.update(encoded_eos)
-                    token_count += 1
-                if token_count > np.iinfo(np.int64).max:
-                    raise OverflowError("mmap corpus token_count exceeds signed int64 capacity")
-                offset = np.asarray([token_count], dtype=_OFFSET_DTYPE).tobytes(order="C")
-                offset_stream.write(offset)
-                offsets_digest.update(offset)
+            iterator = iter(texts)
+            while True:
+                batch: list[str] = []
+                for _ in range(encoding_batch_size):
+                    try:
+                        text = next(iterator)
+                    except StopIteration:
+                        break
+                    document = documents + len(batch) + 1
+                    if not isinstance(text, str):
+                        raise TypeError(
+                            f"mmap document {document} must be a string, "
+                            f"got {type(text).__name__}"
+                        )
+                    batch.append(text)
+                if not batch:
+                    break
+                encode_batch = getattr(tokenizer, "encode_batch", None)
+                if callable(encode_batch):
+                    encoded_batch = encode_batch(
+                        batch,
+                        add_bos=False,
+                        add_eos=False,
+                    )
+                    if len(encoded_batch) != len(batch):
+                        raise ValueError(
+                            "tokenizer.encode_batch returned a different number of documents"
+                        )
+                else:
+                    encoded_batch = [
+                        tokenizer.encode(text, add_bos=False, add_eos=False)
+                        for text in batch
+                    ]
+                for raw_token_ids in encoded_batch:
+                    documents += 1
+                    token_ids = _validate_token_ids(
+                        raw_token_ids,
+                        document=documents,
+                        vocab_size=vocab_size,
+                    )
+                    if not token_ids and not append_eos:
+                        raise ValueError(
+                            f"mmap document {documents} encodes to no tokens while "
+                            "append_eos=false"
+                        )
+                    encoded = np.asarray(token_ids, dtype=token_dtype).tobytes(order="C")
+                    token_stream.write(encoded)
+                    tokens_digest.update(encoded)
+                    token_count += len(token_ids)
+                    if append_eos:
+                        encoded_eos = np.asarray([eos_id], dtype=token_dtype).tobytes(order="C")
+                        token_stream.write(encoded_eos)
+                        tokens_digest.update(encoded_eos)
+                        token_count += 1
+                    if token_count > np.iinfo(np.int64).max:
+                        raise OverflowError(
+                            "mmap corpus token_count exceeds signed int64 capacity"
+                        )
+                    offset = np.asarray([token_count], dtype=_OFFSET_DTYPE).tobytes(order="C")
+                    offset_stream.write(offset)
+                    offsets_digest.update(offset)
+
+        if documents == 0:
+            raise ValueError("cannot build an mmap corpus from zero documents")
 
         document_offsets = np.fromfile(offsets_path, dtype=_OFFSET_DTYPE)
         fingerprint_tokens = np.memmap(
@@ -552,3 +599,21 @@ def preprocess_jsonl_mmap(
     if validated is None:  # pragma: no cover - every successful path self-validates first.
         raise AssertionError("mmap corpus publish completed without a validated artifact")
     return validated
+
+
+def preprocess_jsonl_mmap(
+    input_path: str | Path,
+    output_path: str | Path,
+    tokenizer: TextTokenizer,
+    *,
+    text_key: str = "text",
+    append_eos: bool = True,
+) -> MMapTokenCorpus:
+    """Stream one JSONL corpus into an atomically published mmap artifact."""
+
+    return preprocess_texts_mmap(
+        iter_jsonl_text(input_path, text_key=text_key),
+        output_path,
+        tokenizer,
+        append_eos=append_eos,
+    )

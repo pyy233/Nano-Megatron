@@ -1,0 +1,119 @@
+distributed:
+  backend: nccl
+  timeout_minutes: 30
+  device: cuda
+
+parallel:
+  tensor: 2
+  pipeline: 2
+  context: 1
+  expert: 1
+  data: 2
+  order: [tp, cp, ep, dp, pp]
+  sequence_parallel: true
+
+model:
+  layers: 24
+  hidden_size: 1024
+  ffn_hidden_size: 2736
+  heads: 16
+  kv_heads: 16
+  seq_length: 512
+  vocab_size: 8192
+  dropout: 0.0
+  tie_embeddings: true
+
+precision:
+  params: bfloat16
+  compute: bfloat16
+  grad_reduce: float32
+
+kernels:
+  backend: torch
+
+data_parallel:
+  mode: ddp
+  bucket_bytes: 268435456
+  overlap_grad_reduce: true
+  reshard_after_forward: true
+
+pipeline:
+  schedule: 1f1b
+  overlap_p2p: true
+  virtual_stages_per_rank: 1
+  dynamic_activation_shapes: false
+
+context_parallel:
+  backend: all_gather
+  dropout: 0.0
+
+activation_checkpoint:
+  mode: none
+
+offload:
+  optimizer_state: false
+  zero3_params_and_grads: false
+  activations: false
+
+optimizer:
+  name: adamw
+  lr: 0.0003
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 0.1
+  clip_grad_norm: 1.0
+
+lr_scheduler:
+  schedule: cosine
+  warmup_steps: 210
+  decay_steps: 10488
+  min_lr: 0.00003
+
+training:
+  micro_batch_size: 8
+  gradient_accumulation_steps: 16
+  max_steps: 10488
+  seed: 1234
+  log_interval: 10
+
+checkpoint:
+  directory: checkpoints/tinystories-l40s-311m-tp2-pp2-dp2
+  save_interval: 500
+  async_save: false
+  keep_last: 1
+  save_final: true
+  save_best_validation: true
+
+data:
+  path: null
+  mmap_path: data/processed/tinystories-full-8k/train.mmap
+  text_path: null
+  text_key: text
+  tokenizer:
+    path: data/tokenizers/tinystories-8k-500k
+    append_eos: true
+  num_workers: 2
+  shuffle: true
+  packed_sequences: false
+
+validation:
+  interval: 250
+  batches: 32
+  data:
+    path: null
+    mmap_path: data/processed/tinystories-full-8k/validation.mmap
+    text_path: null
+    text_key: text
+    tokenizer:
+      path: data/tokenizers/tinystories-8k-500k
+      append_eos: true
+    num_workers: 2
+    shuffle: false
+    packed_sequences: false
+
+wandb:
+  enabled: true
+  project: nano-megatron-tinystories
+  name: null
+  group: l40s-311m-tp2-pp2-dp2
+  mode: online

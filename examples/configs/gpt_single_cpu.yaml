@@ -60,6 +60,12 @@ optimizer:
   weight_decay: 0.0
   clip_grad_norm: 1.0
 
+lr_scheduler:
+  schedule: cosine
+  warmup_steps: 0
+  decay_steps: null
+  min_lr: 0.0
+
 training:
   micro_batch_size: 2
   gradient_accumulation_steps: 2
@@ -78,3 +84,13 @@ data:
   num_workers: 0
   shuffle: true
   packed_sequences: false
+
+validation:
+  interval: 0
+  batches: 10
+  data: null
+
+wandb:
+  enabled: false
+  project: nano-megatron
+  mode: offline

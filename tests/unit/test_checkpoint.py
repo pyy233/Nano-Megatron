@@ -71,6 +71,40 @@ def test_dcp_compatibility_drops_unsupported_no_dist_keyword() -> None:
     assert set(captured) == {"state", "checkpoint_id", "process_group"}
 
 
+def test_dcp_compatibility_maps_legacy_subgroup_coordinator_to_global_rank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import torch.distributed as dist
+    from torch.distributed.checkpoint import state_dict_loader, state_dict_saver, utils
+
+    class LegacyDistWrapper:
+        def __init__(self, group, use_dist, coordinator_rank):
+            self.group = group
+            self.use_dist = use_dist
+            self.coordinator_rank = coordinator_rank
+            self.rank = 0
+            self.is_coordinator = self.rank == coordinator_rank
+
+    monkeypatch.setattr(utils, "_DistWrapper", LegacyDistWrapper)
+    monkeypatch.setattr(state_dict_saver, "_DistWrapper", LegacyDistWrapper)
+    monkeypatch.setattr(state_dict_loader, "_DistWrapper", LegacyDistWrapper)
+    monkeypatch.setattr(dist, "get_global_rank", lambda group, rank: (4, 5)[rank])
+    monkeypatch.setattr(
+        checkpoint_manager_module,
+        "_DCP_SUBGROUP_COORDINATOR_PATCHED",
+        False,
+    )
+
+    checkpoint_manager_module._ensure_dcp_subgroup_coordinator_compatibility()
+
+    group = object()
+    wrapped = state_dict_saver._DistWrapper(group, True, 0)
+    assert wrapped.is_coordinator
+    assert wrapped.coordinator_rank == 4
+    assert state_dict_loader._DistWrapper is state_dict_saver._DistWrapper
+    assert utils._DistWrapper is state_dict_saver._DistWrapper
+
+
 def _setup(
     tmp_path: Path,
     *,
@@ -312,6 +346,55 @@ def test_checkpoint_retention(tmp_path: Path) -> None:
             "step_00000002",
         ]
     finally:
+        parallel.close()
+        runtime.close()
+
+
+def test_checkpoint_retention_preserves_and_replaces_best_validation_pin(
+    tmp_path: Path,
+) -> None:
+    runtime, parallel, model, strategy, manager = _setup(tmp_path, keep_last=1)
+    try:
+        first = manager.save(
+            0,
+            model=model,
+            data_parallel=strategy,
+            trainer_state={"step": 0},
+        )
+        assert manager.pin_best_validation(0, 3.5) == first
+        manager.save(
+            1,
+            model=model,
+            data_parallel=strategy,
+            trainer_state={"step": 1},
+        )
+        latest = manager.save(
+            2,
+            model=model,
+            data_parallel=strategy,
+            trainer_state={"step": 2},
+        )
+
+        assert [path.name for path in sorted(tmp_path.glob("step_*"))] == [
+            "step_00000000",
+            "step_00000002",
+        ]
+        assert manager.best_validation() == {
+            "checkpoint": "step_00000000",
+            "format_version": 1,
+            "metric": "loss",
+            "mode": "min",
+            "step": 0,
+            "value": 3.5,
+        }
+
+        assert manager.pin_best_validation(2, 2.75) == latest
+        assert [path.name for path in sorted(tmp_path.glob("step_*"))] == [
+            "step_00000002"
+        ]
+        assert manager.best_validation()["step"] == 2
+    finally:
+        manager.close()
         parallel.close()
         runtime.close()
 
