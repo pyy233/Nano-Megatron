@@ -27,6 +27,18 @@ TinyStories，使用 TP、PP、CP、DP/ZeRO 等并行方式训练 dense GPT，�
 | 训练 | 全量 TinyStories，global batch 256，3 epochs |
 | 最佳验证结果 | loss 1.1795，perplexity 3.2528，step 10250 |
 
+此外，项目在 8×A100 上跑完了当前并行验证矩阵中的五种三维复合拓扑：
+
+```text
+TP2 × PP2 × CP2    TP2 × PP2 × DP2    TP2 × CP2 × DP2
+TP2 × CP2 × EP2    CP2 × EP2 × DP2
+```
+
+这些组合均完成了 BF16 短程训练、validation 和 checkpoint/load，并检查了 process group、
+loss 路由、梯度同步及恢复语义。五种拓扑还分别与 ZeRO-1/2/3 组合，跑完了 15 组训练
+smoke。它们用于验证分布式语义，不代表每种拓扑都做过完整 TinyStories 收敛；其中 EP
+只表示 dense GPT 的拓扑和 replica 语义，不包含 MoE expert dispatch。
+
 推理模型、完整可恢复 checkpoint、tokenizer、训练配置、metrics、W&B 原始记录、终端日志和
 SHA256 清单都在：
 
@@ -46,7 +58,7 @@ SHA256 清单都在：
 | 可观测性 | validation、loss/perplexity、吞吐、显存指标、W&B、独立的 metrics.jsonl |
 | Checkpoint | 同步/异步保存、精确恢复、数据位置与 RNG 状态、best/final checkpoint |
 | 推理闭环 | 合并 DDP/ZeRO-1/2 的 TP/PP shards，导出原生单卡 artifact，采样生成 |
-| 验证 | CPU/Gloo 多进程测试，以及 2×A40、8×L40S 的真实 NCCL 测试 |
+| 验证 | CPU/Gloo 多进程测试，以及 2×A40、8×A100、8×L40S 的真实 NCCL 测试 |
 
 ### 没有包含
 
